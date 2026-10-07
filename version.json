@@ -1,8 +1,8 @@
 {
-  "version": "0.30",
-  "file": "releases/ES-DE-Sync-v0.30.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.30.zip",
-  "sha256": "32370a62433115d111f75a79af09960f9aaec8b382c53428a3399e10279b11d0",
-  "notes": "GitHub 기반 인앱 업데이트 기능 추가",
+  "version": "0.31",
+  "file": "releases/ES-DE-Sync-v0.31.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.31.zip",
+  "sha256": "b73985cd5fd2c4f779e26a25e1dd36cd62c82a3cc0b3293a7675ecf9522a21a3",
+  "notes": "업데이트가 없는데도 업데이트 카드가 보이던 UI 숨김 문제 수정",
   "channel": "stable"
 }
