@@ -1,8 +1,8 @@
 {
-  "version": "0.42",
-  "file": "releases/ES-DE-Sync-v0.42.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.42.zip",
-  "sha256": "59665d745267776a78b4fbf2d24b2ee55f6e2bf313af6c6a4b7e9336b5bed834",
-  "notes": "Android 동기화와 Dropbox 공유 라이브러리를 단일 backend·단일 창으로 통합",
+  "version": "0.43",
+  "file": "releases/ES-DE-Sync-v0.43.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.43.zip",
+  "sha256": "04fea5f853232a12e10358de548eeeddacfa640e07032f93871496edfaea58c0",
+  "notes": "Android 기기별 시스템 기본 에뮬레이터 선택을 보존하도록 gamelist 동기화 개선",
   "channel": "stable"
 }
