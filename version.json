@@ -1,8 +1,8 @@
 {
-  "version": "0.40",
-  "file": "releases/ES-DE-Sync-v0.40.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.40.zip",
-  "sha256": "64009b9a7a6baeeebbe23d99942b51f03811cbe46d737829e1540de83ea83356",
-  "notes": "동기화 결과와 진행 상태의 GUI 표시 형식 수정",
+  "version": "0.41",
+  "file": "releases/ES-DE-Sync-v0.41.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.41.zip",
+  "sha256": "a4b445d150d6345867b14f41c5c4c229ece4134fd456cada974926a5ae607e9b",
+  "notes": "새 Android 기기 프로필 등록 수정, foreground 감지 복구, 통합 허브 및 Dropbox 공유 라이브러리 updater 포함",
   "channel": "stable"
 }
