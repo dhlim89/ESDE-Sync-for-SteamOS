@@ -1,8 +1,8 @@
 {
-  "version": "0.39",
-  "file": "releases/ES-DE-Sync-v0.39.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.39.zip",
-  "sha256": "a046cdf6e7af79722f25e39fd569cc676b1eb75ed68755f84315af11aff52147",
-  "notes": "Android의 playcount, playtime, lastplayed를 보존하는 gamelist runtime merge 적용",
+  "version": "0.40",
+  "file": "releases/ES-DE-Sync-v0.40.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.40.zip",
+  "sha256": "64009b9a7a6baeeebbe23d99942b51f03811cbe46d737829e1540de83ea83356",
+  "notes": "동기화 결과와 진행 상태의 GUI 표시 형식 수정",
   "channel": "stable"
 }
