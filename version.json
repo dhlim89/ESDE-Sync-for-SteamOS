@@ -1,8 +1,8 @@
 {
-  "version": "0.34",
-  "file": "releases/ES-DE-Sync-v0.34.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.34.zip",
-  "sha256": "c21150c01f914166bbdc61a687d00a6304f45c644672f4d8e659a56330543e27",
-  "notes": "자동 업데이트 검증용 릴리스",
+  "version": "0.36",
+  "file": "releases/ES-DE-Sync-v0.36.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.36.zip",
+  "sha256": "1a06484a8e8100fbdee06c2031b0f017f29a8a094d75e4f018d07349576a732c",
+  "notes": "자동 업데이트 실전 검증용 릴리스",
   "channel": "stable"
 }
