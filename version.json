@@ -1,7 +1,8 @@
 {
-  "version": "0.29",
-  "file": "releases/ES-DE-Sync-v0.29.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.29.zip",
-  "notes": "Android foreground app detection compatibility improvements",
+  "version": "0.30",
+  "file": "releases/ES-DE-Sync-v0.30.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.30.zip",
+  "sha256": "32370a62433115d111f75a79af09960f9aaec8b382c53428a3399e10279b11d0",
+  "notes": "GitHub 기반 인앱 업데이트 기능 추가",
   "channel": "stable"
 }
