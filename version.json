@@ -1,8 +1,8 @@
 {
-  "version": "0.36",
-  "file": "releases/ES-DE-Sync-v0.36.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.36.zip",
-  "sha256": "1a06484a8e8100fbdee06c2031b0f017f29a8a094d75e4f018d07349576a732c",
-  "notes": "자동 업데이트 실전 검증용 릴리스",
+  "version": "0.37",
+  "file": "releases/ES-DE-Sync-v0.37.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.37.zip",
+  "sha256": "8b4853de625f6d72c08683f9d7d0a6f1c9c0bd0d0a546f12ec819bb5cc8998a7",
+  "notes": "GitHub Contents API로 업데이트 정보 조회: 오래된 raw 메타데이터 문제 개선",
   "channel": "stable"
 }

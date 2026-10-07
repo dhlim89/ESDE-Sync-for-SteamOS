@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ES-DE Sync</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <header>
+    <div>
+      <div class="eyebrow">LEGION GO S · MASTER LIBRARY</div>
+      <div class="title-row"><h1>ES-DE Sync</h1><span class="version-badge">v0.36</span></div>
+      <p>Android ES-DE 라이브러리를 한 번에 맞춥니다.</p>
+    </div>
+    <div id="devicePill" class="pill offline"><span class="dot"></span><span id="deviceName">기기 확인 중</span></div>
+  </header>
+
+  <section class="hero">
+    <div>
+      <div class="label">연결된 기기</div>
+      <div class="device-title" id="deviceTitle">—</div>
+      <div class="muted mono" id="serial">—</div>
+    </div>
+    <div class="systems">
+      <div class="systems-head">
+        <div class="label">동기화 시스템</div>
+        <button id="editSystemsBtn" class="tiny-btn hidden" onclick="openSystemEditor()">편집</button>
+      </div>
+      <div id="systems" class="chips"><span>—</span></div>
+    </div>
+  </section>
+
+
+  <section id="updateBox" class="update-box hidden">
+    <div>
+      <div class="label">업데이트</div>
+      <div id="updateTitle" class="update-title">새 버전이 있습니다.</div>
+      <div id="updateNotes" class="update-desc"></div>
+    </div>
+    <button id="updateBtn" onclick="installUpdate()">업데이트</button>
+  </section>
+
+  <section id="registerBox" class="register-box hidden">
+    <div class="register-main">
+      <div class="label">새 기기 발견</div>
+      <div class="register-title" id="registerTitle">등록되지 않은 Android 기기입니다.</div>
+      <div class="register-desc">검증된 Android 기본 설정을 바탕으로 프로필을 만들고, 이 기기에서 동기화할 시스템을 선택합니다.</div>
+      <div class="system-select-label">동기화 시스템</div>
+      <div id="registerSystems" class="system-picker"></div>
+    </div>
+    <button id="registerBtn" onclick="registerDevice()">기기 등록</button>
+  </section>
+
+
+  <section id="systemEditor" class="register-box hidden">
+    <div class="register-main">
+      <div class="label">동기화 시스템 편집</div>
+      <div class="register-title">이 기기에서 동기화할 시스템을 선택합니다.</div>
+      <div class="register-desc">다른 프로필 설정은 유지되고 `SYSTEMS=` 항목만 변경됩니다.</div>
+      <div id="editSystemsPicker" class="system-picker"></div>
+    </div>
+    <div class="editor-actions">
+      <button class="ghost" onclick="closeSystemEditor()">취소</button>
+      <button onclick="saveSystems()">저장</button>
+    </div>
+  </section>
+
+  <section class="cards">
+    <article><div class="icon">ROM</div><div><h3>게임 ROM</h3><p>Legion Go S 기준 완전 미러링</p></div><span class="badge">Mirror</span></article>
+    <article><div class="icon">XML</div><div><h3>gamelist</h3><p>기기별 에뮬레이터 변환 후 동기화</p></div><span class="badge">Transform</span></article>
+    <article><div class="icon">IMG</div><div><h3>downloaded_media</h3><p>표지·스크린샷·영상 완전 미러링</p></div><span class="badge">Mirror</span></article>
+  </section>
+
+  <section class="syncbox">
+    <div class="statusline">
+      <div>
+        <div class="label">현재 상태</div>
+        <div id="statusText" class="status-text">대기 중</div>
+      </div>
+      <div id="percent" class="percent">0%</div>
+    </div>
+    <div class="bar"><div id="barFill"></div></div>
+    <button id="startBtn" onclick="startSync()">동기화 시작</button>
+  </section>
+
+  <section id="resultBox" class="result hidden">
+    <div class="result-head">
+      <div>
+        <div class="label">최근 동기화 결과</div>
+        <h2 id="resultTitle">완료</h2>
+      </div>
+      <div class="result-actions">
+        <button id="copyBtn" class="ghost" onclick="copyResult()">복사</button>
+        <button class="ghost" onclick="toggleDetails()">상세 보기</button>
+      </div>
+    </div>
+    <pre id="resultText" class="hidden"></pre>
+  </section>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
