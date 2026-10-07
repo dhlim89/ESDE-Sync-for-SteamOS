@@ -1,0 +1,7 @@
+{
+  "version": "0.29",
+  "file": "releases/ES-DE-Sync-v0.29.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.29.zip",
+  "notes": "Android foreground app detection compatibility improvements",
+  "channel": "stable"
+}
