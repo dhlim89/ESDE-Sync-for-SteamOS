@@ -1,7 +1,7 @@
 {
   "version": "0.43",
   "file": "releases/ES-DE-Sync-v0.43.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/esde-sync/main/releases/ES-DE-Sync-v0.43.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/ESDE-Sync-for-SteamOS/main/releases/ES-DE-Sync-v0.43.zip",
   "sha256": "04fea5f853232a12e10358de548eeeddacfa640e07032f93871496edfaea58c0",
   "notes": "Android 기기별 시스템 기본 에뮬레이터 선택을 보존하도록 gamelist 동기화 개선",
   "channel": "stable"
