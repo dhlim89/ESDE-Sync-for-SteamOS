@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=ES-DE Sync
+Comment=Android 기기 및 Dropbox 공유 라이브러리 ES-DE 동기화
+Exec=@HOME@/.local/bin/esde-sync
+Icon=folder-sync
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+Actions=AndroidSync;SharedLibrary;
+
+[Desktop Action AndroidSync]
+Name=Android 기기 동기화
+Exec=@HOME@/.local/bin/esde-sync --page=android
+Icon=phone
+
+[Desktop Action SharedLibrary]
+Name=Dropbox 공유 라이브러리
+Exec=@HOME@/.local/bin/esde-sync --page=dropbox
+Icon=folder-cloud

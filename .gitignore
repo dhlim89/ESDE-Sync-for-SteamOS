@@ -1,0 +1,22 @@
+# Local evidence and generated artifacts
+.review/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+.DS_Store
+# Local test outputs
+tests/results/
+tests/output/
+tests/tmp/
+# User data (never publish)
+profiles/
+Dropbox/
+Emulation/
+ES-DE/
+.env
+.env.*
+# Keep releases/*.zip tracked explicitly

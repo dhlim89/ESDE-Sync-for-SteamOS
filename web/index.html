@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ES-DE Sync</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <header class="app-header">
+    <div class="title-row"><h1>ES-DE Sync</h1><span id="versionBadge" class="version-badge">v0.44</span></div>
+    <div class="common-update"><span id="commonUpdateStatus">업데이트 확인 중</span>
+      <button id="checkUpdateBtn" class="ghost" onclick="checkUpdate()">확인</button>
+      <button id="updateBtn" onclick="installUpdate()" disabled>앱 업데이트</button></div>
+  </header>
+  <div class="app-layout">
+    <nav aria-label="기능 선택">
+      <button id="navAndroid" class="nav-button active" onclick="navigate('android')">Android 동기화</button>
+      <button id="navDropbox" class="nav-button" onclick="navigate('dropbox')">Dropbox 라이브러리</button>
+    </nav>
+    <main>
+    <section id="androidPage" aria-label="Android 동기화">
+      <div id="devicePill" class="pill offline"><span class="dot"></span><span id="deviceName">기기 확인 중</span></div>
+  <section class="hero">
+    <div>
+      <div class="label">연결된 기기</div>
+      <div class="device-title" id="deviceTitle">—</div>
+      <div class="muted mono" id="serial">—</div>
+    </div>
+    <div class="systems">
+      <div class="systems-head">
+        <div class="label">동기화 시스템</div>
+        <button id="editSystemsBtn" class="tiny-btn hidden" onclick="openSystemEditor()">편집</button>
+      </div>
+      <div id="systems" class="chips"><span>—</span></div>
+    </div>
+  </section>
+
+
+  <section id="registerBox" class="register-box hidden">
+    <div class="register-main">
+      <div class="label">새 기기 발견</div>
+      <div class="register-title" id="registerTitle">등록되지 않은 Android 기기입니다.</div>
+      <div class="register-desc">검증된 Android 기본 설정을 바탕으로 프로필을 만들고, 이 기기에서 동기화할 시스템을 선택합니다.</div>
+      <div class="system-select-label">동기화 시스템</div>
+      <div id="registerSystems" class="system-picker"></div>
+    </div>
+    <button id="registerBtn" onclick="registerDevice()">기기 등록</button>
+  </section>
+
+
+  <section id="systemEditor" class="register-box hidden">
+    <div class="register-main">
+      <div class="label">동기화 시스템 편집</div>
+      <div class="register-title">이 기기에서 동기화할 시스템을 선택합니다.</div>
+      <div class="register-desc">다른 프로필 설정은 유지되고 `SYSTEMS=` 항목만 변경됩니다.</div>
+      <div id="editSystemsPicker" class="system-picker"></div>
+    </div>
+    <div class="editor-actions">
+      <button class="ghost" onclick="closeSystemEditor()">취소</button>
+      <button id="saveSystemsBtn" onclick="saveSystems()">저장</button>
+    </div>
+  </section>
+
+  <section class="cards">
+    <article><div class="icon">ROM</div><div><h3>게임 ROM</h3><p>Legion Go S 기준 완전 미러링</p></div><span class="badge">Mirror</span></article>
+    <article><div class="icon">XML</div><div><h3>gamelist</h3><p>기기별 에뮬레이터 변환 후 동기화</p></div><span class="badge">Transform</span></article>
+    <article><div class="icon">IMG</div><div><h3>downloaded_media</h3><p>표지·스크린샷·영상 완전 미러링</p></div><span class="badge">Mirror</span></article>
+  </section>
+
+  <section class="syncbox">
+    <div class="statusline">
+      <div>
+        <div class="label">현재 상태</div>
+        <div id="statusText" class="status-text">대기 중</div>
+      </div>
+      <div id="percent" class="percent">0%</div>
+    </div>
+    <div class="bar"><div id="barFill"></div></div>
+    <button id="startBtn" onclick="startSync()">동기화 시작</button>
+  </section>
+
+  <section id="resultBox" class="result hidden">
+    <div class="result-head">
+      <div>
+        <div class="label">최근 동기화 결과</div>
+        <h2 id="resultTitle">완료</h2>
+      </div>
+      <div class="result-actions">
+        <button id="copyBtn" class="ghost" onclick="copyResult()">복사</button>
+        <button class="ghost" onclick="toggleDetails()">상세 보기</button>
+      </div>
+    </div>
+    <pre id="resultText" class="hidden"></pre>
+  </section>
+    </section>
+    <section id="dropboxPage" class="hidden" aria-label="Dropbox 라이브러리">
+      <h2>Dropbox 공유 라이브러리</h2>
+      <p id="dropboxTarget" class="mono"></p>
+      <p id="dropboxCounts" class="muted"></p>
+      <div class="selection-actions">
+        <button id="dbAllBtn" class="ghost" onclick="selectDropbox('all')">전체 선택</button>
+        <button id="dbNoneBtn" class="ghost" onclick="selectDropbox('none')">전체 해제</button>
+        <button id="dbRomBtn" class="ghost" onclick="selectDropbox('rom')">ROM 있는 시스템만</button>
+      </div>
+      <div id="dropboxSystems" class="dropbox-list"></div>
+      <p class="note">gamelist는 Linux 원본을 수정하지 않고 Android용 사본으로 변환합니다. GB/GBC의 Sameboy (Standalone) → My OldBoy! (Standalone)만 정확히 변환하며 RetroArch SameBoy는 유지합니다.</p>
+      <p class="note">선택 해제 시스템과 Legion에서 삭제된 파일은 Dropbox 배포본에서도 삭제됩니다.</p>
+      <div id="dropboxProgress" class="status-text">대기 중</div>
+      <button id="dropboxStartBtn" onclick="startDropbox()">선택 저장 및 공유 라이브러리 업데이트</button>
+      <section id="dropboxResultBox" class="result hidden">
+        <div class="result-head"><h2 id="dropboxResultTitle"></h2>
+          <button class="ghost" onclick="toggleDropboxDetails()">상세 보기</button></div>
+        <pre id="dropboxResultText" class="hidden"></pre>
+      </section>
+    </section>
+    </main>
+  </div>
+  <footer class="app-footer">
+    <div id="activeJobStatus">현재 실행 작업: 없음</div>
+    <div id="recentAndroid">최근 Android 결과: 없음</div>
+    <div id="recentDropbox">최근 Dropbox 결과: 없음</div>
+    <div id="connectionStatus" class="muted"></div>
+  </footer>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

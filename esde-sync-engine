@@ -1,0 +1,901 @@
+#!/usr/bin/env bash
+set -u
+
+APP_NAME="ES-DE Sync"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/esde-sync"
+PROFILE_DIR="$CONFIG_DIR/profiles"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/esde-sync"
+TMP_DIR="${TMPDIR:-/tmp}/esde-sync"
+LOG_FILE="$STATE_DIR/esde-sync.log"
+GUI_MODE="${ESDE_SYNC_GUI_MODE:-0}"
+GUI_STATUS_FILE="${ESDE_SYNC_STATUS_FILE:-$STATE_DIR/gui-status.tsv}"
+GUI_RESULT_FILE="${ESDE_SYNC_RESULT_FILE:-$STATE_DIR/gui-result.txt}"
+
+mkdir -p "$PROFILE_DIR" "$STATE_DIR" "$TMP_DIR"
+
+gui_status() {
+  local value="$1" max="$2" label="$3"
+  [[ "$GUI_MODE" == "1" ]] || return 0
+  printf '%s\t%s\t%s\n' "$value" "$max" "$label" > "$GUI_STATUS_FILE"
+}
+
+
+ROM_EXTENSIONS=(gb gbc gba zip 7z nes fds smc sfc md gen bin gg sms pce cue chd iso cso pbp n64 z64 v64 nds)
+
+ESDE_PACKAGE_DEFAULT="org.es_de.frontend"
+ESDE_ACTIVITY_DEFAULT="org.es_de.frontend/.MainActivityHomeApp"
+
+PROGRESS_REF=""
+QDBUS_CMD=""
+PROGRESS_VALUE=0
+PROGRESS_MAX=1
+
+notify() {
+  local title="$1" text="$2"
+  if [[ "$GUI_MODE" == "1" ]]; then
+    printf 'OK
+%s
+' "$text" > "$GUI_RESULT_FILE"
+    gui_status "$PROGRESS_MAX" "$PROGRESS_MAX" "완료"
+    return 0
+  fi
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "$title" --msgbox "$text" >/dev/null 2>&1 || true
+  else
+    printf '
+%s
+%s
+' "$title" "$text"
+  fi
+}
+
+error() {
+  local text="$1"
+  progress_close
+  if [[ "$GUI_MODE" == "1" ]]; then
+    printf 'ERROR
+%s
+' "$text" > "$GUI_RESULT_FILE"
+    gui_status "$PROGRESS_VALUE" "$PROGRESS_MAX" "오류"
+    return 0
+  fi
+  if command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "$APP_NAME" --error "$text" >/dev/null 2>&1 || true
+  else
+    printf 'ERROR: %s
+' "$text" >&2
+  fi
+}
+
+detect_qdbus() {
+  if command -v qdbus6 >/dev/null 2>&1; then QDBUS_CMD="qdbus6"
+  elif command -v qdbus >/dev/null 2>&1; then QDBUS_CMD="qdbus"
+  elif command -v qdbus-qt5 >/dev/null 2>&1; then QDBUS_CMD="qdbus-qt5"
+  else QDBUS_CMD=""
+  fi
+}
+
+progress_start() {
+  local max="$1" label="$2"
+  PROGRESS_MAX="$max"; PROGRESS_VALUE=0
+  gui_status 0 "$max" "$label"
+  detect_qdbus
+  if [[ "$GUI_MODE" != "1" ]] && command -v kdialog >/dev/null 2>&1 && [[ -n "$QDBUS_CMD" ]]; then
+    PROGRESS_REF="$(kdialog --title "$APP_NAME" --progressbar "$label" "$max" 2>/dev/null || true)"
+    if [[ -n "$PROGRESS_REF" ]]; then
+      $QDBUS_CMD $PROGRESS_REF setAutoClose false >/dev/null 2>&1 || true
+      $QDBUS_CMD $PROGRESS_REF showCancelButton false >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+progress_update() {
+  local value="$1" label="$2"
+  PROGRESS_VALUE="$value"
+  gui_status "$value" "$PROGRESS_MAX" "$label"
+  if [[ -n "$PROGRESS_REF" && -n "$QDBUS_CMD" ]]; then
+    $QDBUS_CMD $PROGRESS_REF Set "" value "$value" >/dev/null 2>&1 || true
+    $QDBUS_CMD $PROGRESS_REF setLabelText "$label" >/dev/null 2>&1 || true
+  fi
+}
+
+progress_step() {
+  local label="$1"
+  PROGRESS_VALUE=$((PROGRESS_VALUE + 1))
+  ((PROGRESS_VALUE > PROGRESS_MAX)) && PROGRESS_VALUE="$PROGRESS_MAX"
+  progress_update "$PROGRESS_VALUE" "$label"
+}
+
+progress_close() {
+  if [[ -n "$PROGRESS_REF" && -n "$QDBUS_CMD" ]]; then
+    $QDBUS_CMD $PROGRESS_REF close >/dev/null 2>&1 || true
+  fi
+  PROGRESS_REF=""
+  [[ "$GUI_MODE" == "1" ]] && return 0
+}
+
+sanitize() { printf '%s' "$1" | tr -cs '[:alnum:]_.-' '_'; }
+adb_device_count() { adb devices </dev/null | awk 'NR>1 && $2=="device"{c++} END{print c+0}'; }
+first_device_serial() { adb devices </dev/null | awk 'NR>1 && $2=="device"{print $1; exit}'; }
+get_prop() { adb -s "$1" shell getprop "$2" </dev/null 2>/dev/null | tr -d '\r'; }
+
+is_rom_file() {
+  local file="$1" name ext allowed
+  name="${file##*/}"; [[ "$name" == *.* ]] || return 1
+  ext="${name##*.}"; ext="${ext,,}"
+  for allowed in "${ROM_EXTENSIONS[@]}"; do
+    [[ "$ext" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+remote_size() {
+  local serial="$1" remote="$2"
+  local escaped="${remote//\'/\'\\\'\'}"
+  adb -s "$serial" shell "stat -c %s '$escaped' 2>/dev/null" </dev/null | tr -d '\r'
+}
+
+remote_sha256() {
+  local serial="$1" remote="$2"
+  local escaped="${remote//\'/\'\\\'\'}"
+  adb -s "$serial" exec-out "cat '$escaped' 2>/dev/null" </dev/null | sha256sum | awk '{print $1}'
+}
+
+push_file() {
+  local serial="$1" local_file="$2" remote_file="$3"
+  adb -s "$serial" shell mkdir -p "$(dirname "$remote_file")" </dev/null >>"$LOG_FILE" 2>&1 || return 1
+  adb -s "$serial" push "$local_file" "$remote_file" </dev/null >>"$LOG_FILE" 2>&1
+}
+
+delete_remote_file() {
+  local serial="$1" remote_file="$2"
+  local escaped="${remote_file//\'/\'\\\'\'}"
+  adb -s "$serial" shell "rm -f '$escaped'" </dev/null >>"$LOG_FILE" 2>&1
+}
+
+transform_gamelist() {
+  local input="$1" output="$2" mapping="$3" count_file="$4" system="$5" removed_file="$6" remote_input="${7:-}"
+  python3 - "$input" "$output" "$mapping" "$count_file" "$system" "$removed_file" "$remote_input" >>"$LOG_FILE" 2>&1 <<'PY'
+import sys, re, copy
+import xml.etree.ElementTree as ET
+
+src, dst, mapping_text, count_file, system, removed_file, remote_input = sys.argv[1:8]
+
+mapping = {}
+if mapping_text.strip():
+    for item in mapping_text.split("||"):
+        if "=>" in item:
+            old, new = item.split("=>", 1)
+            mapping[old] = new
+
+with open(src, "r", encoding="utf-8-sig", newline="") as f:
+    text = f.read()
+
+def parse_fragments(raw):
+    # Keep the existing XML declaration + synthetic-root fragment support.
+    raw = re.sub(r"<\?xml[^>]*\?>", "", raw).strip()
+    if not raw:
+        raise ValueError("gamelist가 비어 있습니다.")
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
+    return ET.fromstring(f"<synthetic>{raw}</synthetic>", parser=parser)
+
+
+def game_index(root):
+    games = {}
+    for top in list(root):
+        entries = list(top) if top.tag == "gameList" else [top]
+        for entry in entries:
+            if entry.tag != "game":
+                continue
+            path = (entry.findtext("path") or "").strip()
+            if not path or path in games:
+                raise ValueError(f"game path가 없거나 중복되었습니다: {path!r}")
+            games[path] = entry
+    return games
+
+
+def field_bytes(field):
+    field = copy.deepcopy(field)
+    field.tail = None
+    return ET.tostring(field, encoding="utf-8")
+
+
+master = parse_fragments(text)
+master_games = game_index(master)
+runtime_merged = False
+system_default_merged = False
+if remote_input:
+    with open(remote_input, "r", encoding="utf-8-sig", newline="") as f:
+        android_root = parse_fragments(f.read())
+        android_games = game_index(android_root)
+    # System defaults are siblings of gameList, never game-level altemulator.
+    android_defaults = android_root.findall("alternativeEmulator")
+    legion_defaults = master.findall("alternativeEmulator")
+    if len(android_defaults) > 1 or len(legion_defaults) > 1:
+        raise ValueError("system-level alternativeEmulator가 중복되었습니다.")
+    # Presence matters: an explicitly empty Android default is preserved too.
+    if android_defaults:
+        android_default = android_defaults[0]
+        if not legion_defaults or field_bytes(legion_defaults[0]) != field_bytes(android_default):
+            position = list(master).index(legion_defaults[0]) if legion_defaults else 0
+            field = copy.deepcopy(android_default)
+            if legion_defaults:
+                field.tail = legion_defaults[0].tail
+                master.remove(legion_defaults[0])
+            master.insert(position, field)
+            system_default_merged = True
+    for path, game in master_games.items():
+        android = android_games.get(path)
+        if android is None:
+            continue
+        for tag in ("playcount", "playtime", "lastplayed"):
+            android_fields = android.findall(tag)
+            if len(android_fields) > 1:
+                raise ValueError(f"Android runtime 태그가 중복되었습니다: {path!r} {tag}")
+            # Test tag presence, never truthiness: zero and empty values belong
+            # to Android too. Only an absent tag falls back to Legion.
+            if not android_fields:
+                continue
+            legion_fields = game.findall(tag)
+            if len(legion_fields) == 1 and field_bytes(legion_fields[0]) == field_bytes(android_fields[0]):
+                continue
+            position = list(game).index(legion_fields[0]) if legion_fields else len(game)
+            tail = legion_fields[0].tail if legion_fields else android_fields[0].tail
+            for field in legion_fields:
+                game.remove(field)
+            field = copy.deepcopy(android_fields[0])
+            field.tail = tail
+            game.insert(position, field)
+            runtime_merged = True
+    # Android-only games are intentionally never appended to the master tree.
+    if runtime_merged or system_default_merged:
+        text = "".join(ET.tostring(child, encoding="unicode", short_empty_elements=False) for child in list(master))
+
+changed = 0
+removed = 0
+
+def repl(m):
+    global changed, removed
+    value = m.group(1)
+
+    # Arcade keeps every altemulator exactly as-is.
+    if system == "arcade":
+        return m.group(0)
+
+    # Other systems:
+    # 1) Standalone entries are kept, and mapped when a device mapping exists.
+    if "(Standalone)" in value:
+        if value in mapping:
+            changed += 1
+            return f"<altemulator>{mapping[value]}</altemulator>"
+        return m.group(0)
+
+    # 2) Non-Standalone entries are RetroArch-core selections and are removed
+    #    from the Android-bound temporary gamelist.
+    removed += 1
+    return ""
+
+result = re.sub(r"<altemulator>(.*?)</altemulator>", repl, text, flags=re.DOTALL)
+
+# Preserve original bytes when nothing changed, avoiding needless formatting churn.
+if not runtime_merged and not system_default_merged and changed == 0 and removed == 0:
+    with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+        fdst.write(fsrc.read())
+else:
+    with open(dst, "w", encoding="utf-8", newline="") as f:
+        f.write(result)
+
+with open(count_file, "w", encoding="ascii") as f:
+    f.write(str(changed))
+with open(removed_file, "w", encoding="ascii") as f:
+    f.write(str(removed))
+PY
+}
+
+read_remote_gamelist() {
+  local serial="$1" remote="$2" output="$3" escaped status
+  escaped="${remote//\'/\'\\\'\'}"
+  # Exit 3 explicitly means missing; transport/read errors must never become
+  # permission to overwrite Android runtime history with the master file.
+  if adb -s "$serial" exec-out "
+    if [ -f '$escaped' ]; then
+      cat '$escaped'
+    elif [ ! -e '$escaped' ]; then
+      exit 3
+    else
+      exit 1
+    fi
+  " </dev/null > "$output" 2>>"$LOG_FILE"; then
+    return 0
+  else
+    status=$?
+    rm -f "$output"
+    [[ "$status" == "3" ]] && return 0
+    printf 'GAMELIST READ FAILED: %s\n' "$remote" >>"$LOG_FILE"
+    return 1
+  fi
+}
+
+xml_semantic_equal() {
+  local left="$1" right="$2"
+  python3 - "$left" "$right" >>"$LOG_FILE" 2>&1 <<'PY'
+import sys
+import re
+import xml.etree.ElementTree as ET
+
+def text(v):
+    return (v or "").strip()
+
+def parse_fragments(path):
+    raw = open(path, "r", encoding="utf-8-sig", errors="replace").read()
+    raw = re.sub(r"<\?xml[^>]*\?>", "", raw).strip()
+    # Wrap possibly multiple top-level fragments in a synthetic root.
+    wrapped = f"<synthetic>{raw}</synthetic>"
+    return ET.fromstring(wrapped)
+
+def canonical_entry(elem):
+    attrs = tuple(sorted((k, text(v)) for k, v in elem.attrib.items()))
+    children = []
+    for child in list(elem):
+        cattrs = tuple(sorted((k, text(v)) for k, v in child.attrib.items()))
+        nested = tuple(sorted(canonical_entry(x) for x in list(child))) if list(child) else ()
+        children.append((child.tag, text(child.text), cattrs, nested))
+    children.sort()
+    return (elem.tag, attrs, tuple(children))
+
+def canonical_doc(path):
+    root = parse_fragments(path)
+    items = []
+    for top in list(root):
+        # If top-level item is a gamelist wrapper, compare its children.
+        if top.tag == "gameList":
+            for e in list(top):
+                items.append(canonical_entry(e))
+        else:
+            items.append(canonical_entry(top))
+    items.sort()
+    return tuple(items)
+
+try:
+    a = canonical_doc(sys.argv[1])
+    b = canonical_doc(sys.argv[2])
+except Exception as e:
+    print(f"GAMELIST CANONICALIZE ERROR: {e}", file=sys.stderr)
+    sys.exit(2)
+
+sys.exit(0 if a == b else 1)
+PY
+}
+
+
+xml_semantic_diff() {
+  local left="$1" right="$2" system="$3" out="$4"
+  python3 - "$left" "$right" "$system" "$out" >>"$LOG_FILE" 2>&1 <<'PY'
+import sys
+import re
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+left, right, system, out = sys.argv[1:5]
+
+def norm(v):
+    return (v or "").strip()
+
+def parse_fragments(path):
+    raw = open(path, "r", encoding="utf-8-sig", errors="replace").read()
+    raw = re.sub(r"<\?xml[^>]*\?>", "", raw).strip()
+    wrapped = f"<synthetic>{raw}</synthetic>"
+    return ET.fromstring(wrapped)
+
+def entries(path):
+    root = parse_fragments(path)
+    result = {}
+    tops = []
+    for top in list(root):
+        if top.tag == "gameList":
+            tops.extend(list(top))
+        else:
+            tops.append(top)
+    for elem in tops:
+        p = elem.find("path")
+        key = (elem.tag, norm(p.text if p is not None else ""))
+        values = defaultdict(list)
+        for child in list(elem):
+            values[child.tag].append(norm(child.text))
+        result[key] = {k: tuple(sorted(v)) for k, v in values.items()}
+    return result
+
+def key_text(k):
+    typ, path = k
+    return f"{typ}:{path or '(path 없음)'}"
+
+try:
+    legion = entries(left)
+    pocket = entries(right)
+except Exception as exc:
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(f"[{system}] XML 파싱 오류: {exc}\n")
+    sys.exit(0)
+
+lines = []
+for key in sorted(set(legion) | set(pocket)):
+    if key not in legion:
+        lines.append(f"[{system}] Pocket에만 항목 존재: {key_text(key)}")
+        continue
+    if key not in pocket:
+        lines.append(f"[{system}] Legion에만 항목 존재: {key_text(key)}")
+        continue
+
+    for tag in sorted(set(legion[key]) | set(pocket[key])):
+        lv = legion[key].get(tag, ())
+        pv = pocket[key].get(tag, ())
+        if lv != pv:
+            lines.append(
+                f"[{system}] {key_text(key)} / <{tag}> | "
+                f"Legion={lv!r} | Pocket={pv!r}"
+            )
+
+limit = 30
+shown = lines[:limit]
+if len(lines) > limit:
+    shown.append(f"… 외 {len(lines)-limit}개 차이")
+
+with open(out, "w", encoding="utf-8") as f:
+    if shown:
+        f.write("\n".join(shown) + "\n")
+    else:
+        f.write(f"[{system}] 구조 비교상 차이 항목을 찾지 못함\n")
+PY
+}
+
+list_altemulator_games() {
+  local input="$1" system="$2" out="$3"
+  python3 - "$input" "$system" "$out" >>"$LOG_FILE" 2>&1 <<'PY'
+import sys
+import re
+import xml.etree.ElementTree as ET
+
+path, system, out = sys.argv[1:4]
+
+def norm(v):
+    return (v or "").strip()
+
+raw = open(path, "r", encoding="utf-8-sig", errors="replace").read()
+raw = re.sub(r"<\?xml[^>]*\?>", "", raw).strip()
+root = ET.fromstring(f"<synthetic>{raw}</synthetic>")
+
+tops = []
+for top in list(root):
+    if top.tag == "gameList":
+        tops.extend(list(top))
+    else:
+        tops.append(top)
+
+rows = []
+for elem in tops:
+    if elem.tag not in ("game", "folder"):
+        continue
+    alt = elem.find("altemulator")
+    if alt is None or not norm(alt.text):
+        continue
+    p = elem.find("path")
+    n = elem.find("name")
+    rows.append((
+        norm(p.text if p is not None else ""),
+        norm(n.text if n is not None else ""),
+        norm(alt.text),
+    ))
+
+rows.sort(key=lambda x: (x[0], x[1], x[2]))
+with open(out, "w", encoding="utf-8") as f:
+    for p, n, alt in rows:
+        label = n or p or "(이름 없음)"
+        f.write(f"[{system}] {label} | {p} | {alt}\n")
+PY
+}
+
+
+pull_remote_file() {
+  local serial="$1" remote="$2" local_out="$3"
+  local escaped="${remote//\'/\'\\\'\'}"
+  adb -s "$serial" exec-out "cat '$escaped' 2>/dev/null" </dev/null > "$local_out"
+}
+
+stop_esde() {
+  local serial="$1" package="$2"
+  adb -s "$serial" shell am force-stop "$package" </dev/null >>"$LOG_FILE" 2>&1
+  sleep 1
+}
+
+start_esde() {
+  local serial="$1" activity="$2"
+  adb -s "$serial" shell am start -n "$activity" </dev/null >>"$LOG_FILE" 2>&1
+}
+
+build_remote_index() {
+  local serial="$1" system="$2" remote_root="$3" out="$4"
+  local remote_dir="$remote_root/$system"
+  local escaped="${remote_dir//\'/\'\\\'\'}"
+
+  adb -s "$serial" shell "
+    if [ -d '$escaped' ]; then
+      find '$escaped' -type f -exec stat -c '%n	%s' {} \;
+    fi
+  " </dev/null 2>>"$LOG_FILE" | tr -d '\r' > "$out.raw"
+
+  awk -F '\t' -v root="$remote_root/" 'BEGIN{OFS="\t"} {
+    path=$1
+    sub("^" root, "", path)
+    print path, $2
+  }' "$out.raw" > "$out"
+
+  rm -f "$out.raw"
+}
+
+append_changes() {
+  local label="$1"
+  local max_show="$2"
+  shift 2
+  local -a items=("$@")
+  local total="${#items[@]}"
+  local out="" i=0 item
+
+  (( total == 0 )) && { printf ''; return; }
+
+  out+="
+$label"
+  for item in "${items[@]}"; do
+    out+="
+$item"
+    ((i++))
+    if (( i >= max_show )); then
+      if (( total > max_show )); then
+        out+="
+… 외 $((total-max_show))개"
+      fi
+      break
+    fi
+  done
+
+  printf '%s' "$out"
+}
+
+main() {
+  : > "$LOG_FILE"
+  if [[ "$GUI_MODE" == "1" ]]; then
+    rm -f "$GUI_RESULT_FILE"
+    gui_status 0 1 "준비 중…"
+  fi
+
+  command -v adb >/dev/null 2>&1 || { error "adb를 찾을 수 없습니다."; exit 1; }
+  command -v sha256sum >/dev/null 2>&1 || { error "sha256sum을 찾을 수 없습니다."; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { error "python3를 찾을 수 없습니다."; exit 1; }
+
+  local count serial model manufacturer safe_serial profile
+  count="$(adb_device_count)"
+  if [[ "$count" -eq 0 ]]; then error "USB 디버깅이 허용된 Android 기기를 찾지 못했습니다."; exit 1
+  elif [[ "$count" -gt 1 ]]; then error "Android 기기가 2대 이상 연결되어 있습니다. 한 번에 한 대만 연결해 주세요."; exit 1
+  fi
+
+  serial="$(first_device_serial)"
+  model="$(get_prop "$serial" ro.product.model)"
+  manufacturer="$(get_prop "$serial" ro.product.manufacturer)"
+  safe_serial="$(sanitize "$serial")"
+  profile="$PROFILE_DIR/${safe_serial}.conf"
+
+  [[ -f "$profile" ]] || { error "기기 프로필을 찾을 수 없습니다: $profile"; exit 1; }
+
+  source "$profile"
+
+  LOCAL_GAMELIST_ROOT="${LOCAL_GAMELIST_ROOT:-$HOME/ES-DE/gamelists}"
+  REMOTE_GAMELIST_ROOT="${REMOTE_GAMELIST_ROOT:-/storage/emulated/0/ES-DE/gamelists}"
+  LOCAL_MEDIA_ROOT="${LOCAL_MEDIA_ROOT:-$HOME/Emulation/tools/downloaded_media}"
+  REMOTE_MEDIA_ROOT="${REMOTE_MEDIA_ROOT:-/storage/emulated/0/ES-DE/downloaded_media}"
+  SYNC_GAMELISTS="${SYNC_GAMELISTS:-1}"
+  SYNC_MEDIA="${SYNC_MEDIA:-1}"
+  MIRROR_ROMS="${MIRROR_ROMS:-1}"
+  MIRROR_MEDIA="${MIRROR_MEDIA:-1}"
+  ALTEMU_MAP_GB="${ALTEMU_MAP_GB:-}"
+  ALTEMU_MAP_GBC="${ALTEMU_MAP_GBC:-}"
+  ESDE_PACKAGE="${ESDE_PACKAGE:-$ESDE_PACKAGE_DEFAULT}"
+  ESDE_ACTIVITY="${ESDE_ACTIVITY:-$ESDE_ACTIVITY_DEFAULT}"
+  MANAGE_ESDE="${MANAGE_ESDE:-1}"
+
+  ALTEMU_MAP_GB="${ALTEMU_MAP_GB//SameBoy (Standalone)/Sameboy (Standalone)}"
+  ALTEMU_MAP_GBC="${ALTEMU_MAP_GBC//SameBoy (Standalone)/Sameboy (Standalone)}"
+
+  local rom_copied=0 rom_same=0 rom_failed=0 rom_deleted=0 ignored=0
+  local gl_copied=0 gl_same=0 gl_failed=0 gl_transformed=0 gl_alt_removed=0
+  local media_copied=0 media_same=0 media_failed=0 media_deleted=0 media_total=0 media_seen=0
+  local system file rel rsize mapping
+  local local_gl remote_gl temp_gl remote_temp_gl diff_file alt_list_file count_file removed_file changed removed lhash rhash
+  local media_dir index_file rom_index_file
+  local -a rom_copied_files=()
+  local -a rom_deleted_files=()
+  local -a gamelist_copied_files=()
+  local -a gamelist_diff_reports=()
+  local -a altemulator_games=()
+  local -a media_copied_files=()
+  local -a media_deleted_files=()
+
+  local total_work=2
+  for system in $SYSTEMS; do
+    if [[ -d "$LOCAL_ROM_ROOT/$system" ]]; then
+      while IFS= read -r -d '' file; do is_rom_file "$file" && ((total_work++)); done < <(find "$LOCAL_ROM_ROOT/$system" -type f -print0)
+    fi
+    [[ "$SYNC_GAMELISTS" == "1" && -f "$LOCAL_GAMELIST_ROOT/$system/gamelist.xml" ]] && ((total_work++))
+    if [[ "$SYNC_MEDIA" == "1" && -d "$LOCAL_MEDIA_ROOT/$system" ]]; then
+      while IFS= read -r -d '' file; do ((total_work++)); ((media_total++)); done < <(find "$LOCAL_MEDIA_ROOT/$system" -type f -print0)
+    fi
+  done
+
+  progress_start "$total_work" "동기화를 준비하고 있습니다…"
+
+  local esde_stopped=0 esde_restarted=0
+
+  if [[ "$MANAGE_ESDE" == "1" && "$SYNC_GAMELISTS" == "1" ]]; then
+    progress_update "$PROGRESS_VALUE" "Pocket Classic의 ES-DE를 잠시 종료하고 있습니다…"
+    if stop_esde "$serial" "$ESDE_PACKAGE"; then esde_stopped=1; fi
+    progress_step "ES-DE 종료 완료"
+  else
+    progress_step "ES-DE 자동 관리를 건너뜁니다."
+  fi
+
+  for system in $SYSTEMS; do
+    rom_index_file="$TMP_DIR/remote-rom-${safe_serial}-${system}.tsv"
+    build_remote_index "$serial" "$system" "$REMOTE_ROM_ROOT" "$rom_index_file"
+
+    declare -A REMOTE_ROM_SIZE=()
+    declare -A LOCAL_ROM_PRESENT=()
+
+    while IFS=$'\t' read -r rel rsize; do
+      [[ -n "$rel" ]] && REMOTE_ROM_SIZE["$rel"]="$rsize"
+    done < "$rom_index_file"
+
+    if [[ -d "$LOCAL_ROM_ROOT/$system" ]]; then
+      while IFS= read -r -d '' file; do
+        if ! is_rom_file "$file"; then ((ignored++)); continue; fi
+
+        rel="${file#"$LOCAL_ROM_ROOT"/}"
+        LOCAL_ROM_PRESENT["$rel"]=1
+        progress_update "$PROGRESS_VALUE" "ROM 검사: $rel"
+
+        local lsize
+        lsize="$(stat -c '%s' "$file")"
+        rsize="${REMOTE_ROM_SIZE[$rel]:-}"
+
+        if [[ -n "$rsize" && "$rsize" == "$lsize" ]]; then
+          ((rom_same++))
+        elif push_file "$serial" "$file" "$REMOTE_ROM_ROOT/$rel"; then
+          ((rom_copied++))
+          rom_copied_files+=("✓ $rel")
+          printf 'ROM SYNCED: %s\n' "$rel" >>"$LOG_FILE"
+        else
+          ((rom_failed++))
+        fi
+        progress_step "ROM 처리 완료: $rel"
+      done < <(find "$LOCAL_ROM_ROOT/$system" -type f -print0)
+    fi
+
+    if [[ "$MIRROR_ROMS" == "1" ]]; then
+      for rel in "${!REMOTE_ROM_SIZE[@]}"; do
+        [[ "$rel" == "$system/"* ]] || continue
+        if [[ -z "${LOCAL_ROM_PRESENT[$rel]:-}" ]] && is_rom_file "$rel"; then
+          if delete_remote_file "$serial" "$REMOTE_ROM_ROOT/$rel"; then
+            ((rom_deleted++))
+            rom_deleted_files+=("✗ $rel")
+            printf 'ROM DELETED: %s\n' "$rel" >>"$LOG_FILE"
+          else
+            ((rom_failed++))
+          fi
+        fi
+      done
+    fi
+
+    unset REMOTE_ROM_SIZE LOCAL_ROM_PRESENT
+    rm -f "$rom_index_file"
+
+    if [[ "$SYNC_GAMELISTS" == "1" ]]; then
+      local_gl="$LOCAL_GAMELIST_ROOT/$system/gamelist.xml"
+      remote_gl="$REMOTE_GAMELIST_ROOT/$system/gamelist.xml"
+      if [[ -f "$local_gl" ]]; then
+        progress_update "$PROGRESS_VALUE" "gamelist 변환/비교: $system"
+
+        case "$system" in
+          gb) mapping="$ALTEMU_MAP_GB" ;;
+          gbc) mapping="$ALTEMU_MAP_GBC" ;;
+          *) mapping="" ;;
+        esac
+
+        temp_gl="$TMP_DIR/gamelist-${safe_serial}-${system}.xml"
+        count_file="$TMP_DIR/gamelist-${safe_serial}-${system}.count"
+        rm -f "$count_file"
+
+        removed_file="$TMP_DIR/gamelist-${safe_serial}-${system}.removed"
+        remote_temp_gl="$TMP_DIR/gamelist-remote-${safe_serial}-${system}.xml"
+        local merge_remote=""
+        local master_temp_gl="$TMP_DIR/gamelist-master-${safe_serial}-${system}.xml"
+        # Snapshot Legion first; only this Android-bound working copy is merged.
+        if cp "$local_gl" "$master_temp_gl" && read_remote_gamelist "$serial" "$remote_gl" "$remote_temp_gl"; then
+          [[ -f "$remote_temp_gl" ]] && merge_remote="$remote_temp_gl"
+          if transform_gamelist "$master_temp_gl" "$temp_gl" "$mapping" "$count_file" "$system" "$removed_file" "$merge_remote"; then
+            changed="$(cat "$count_file" 2>/dev/null || printf '0')"
+            removed="$(cat "$removed_file" 2>/dev/null || printf '0')"
+            [[ "$changed" =~ ^[0-9]+$ ]] || changed=0
+            [[ "$removed" =~ ^[0-9]+$ ]] || removed=0
+            gl_transformed=$((gl_transformed + changed))
+            gl_alt_removed=$((gl_alt_removed + removed))
+
+            alt_list_file="$TMP_DIR/altemulator-list-${safe_serial}-${system}.txt"
+            list_altemulator_games "$local_gl" "$system" "$alt_list_file"
+            if [[ -s "$alt_list_file" ]]; then
+              while IFS= read -r alt_line; do
+                altemulator_games+=("$alt_line")
+              done < "$alt_list_file"
+            fi
+            rm -f "$alt_list_file"
+
+            if [[ -s "$remote_temp_gl" ]] && xml_semantic_equal "$temp_gl" "$remote_temp_gl"; then
+              ((gl_same++))
+              printf 'GAMELIST SAME (semantic): %s/gamelist.xml\n' "$system" >>"$LOG_FILE"
+            else
+              if [[ -s "$remote_temp_gl" ]]; then
+                diff_file="$TMP_DIR/gamelist-diff-${safe_serial}-${system}.txt"
+                xml_semantic_diff "$temp_gl" "$remote_temp_gl" "$system" "$diff_file"
+                if [[ -s "$diff_file" ]]; then
+                  while IFS= read -r diff_line; do
+                    gamelist_diff_reports+=("$diff_line")
+                    printf 'GAMELIST DIFF: %s\n' "$diff_line" >>"$LOG_FILE"
+                  done < "$diff_file"
+                fi
+                rm -f "$diff_file"
+              fi
+
+              if push_file "$serial" "$temp_gl" "$remote_gl"; then
+                ((gl_copied++))
+                gamelist_copied_files+=("✓ $system/gamelist.xml")
+                printf 'GAMELIST SYNCED: %s/gamelist.xml\n' "$system" >>"$LOG_FILE"
+              else
+                ((gl_failed++))
+              fi
+            fi
+          else
+            ((gl_failed++))
+            printf 'GAMELIST MERGE/TRANSFORM FAILED: %s/gamelist.xml\n' "$system" >>"$LOG_FILE"
+          fi
+        else
+          ((gl_failed++))
+        fi
+
+        rm -f "$temp_gl" "$count_file" "$removed_file" "$remote_temp_gl" "$master_temp_gl"
+        progress_step "gamelist 처리 완료: $system"
+      fi
+    fi
+
+    if [[ "$SYNC_MEDIA" == "1" ]]; then
+      media_dir="$LOCAL_MEDIA_ROOT/$system"
+      if [[ -d "$media_dir" ]]; then
+        progress_update "$PROGRESS_VALUE" "미디어 목록을 한 번에 불러오는 중: $system"
+        index_file="$TMP_DIR/remote-media-${safe_serial}-${system}.tsv"
+        build_remote_index "$serial" "$system" "$REMOTE_MEDIA_ROOT" "$index_file"
+
+        declare -A REMOTE_MEDIA_SIZE=()
+        declare -A LOCAL_MEDIA_PRESENT=()
+        while IFS=$'\t' read -r rel rsize; do
+          [[ -n "$rel" ]] && REMOTE_MEDIA_SIZE["$rel"]="$rsize"
+        done < "$index_file"
+
+        while IFS= read -r -d '' file; do
+          ((media_seen++))
+          rel="${file#"$LOCAL_MEDIA_ROOT"/}"
+          LOCAL_MEDIA_PRESENT["$rel"]=1
+          progress_update "$PROGRESS_VALUE" "미디어 검사 ${media_seen}/${media_total}: $rel"
+
+          local lsize
+          lsize="$(stat -c '%s' "$file")"
+          rsize="${REMOTE_MEDIA_SIZE[$rel]:-}"
+
+          if [[ -n "$rsize" && "$rsize" == "$lsize" ]]; then
+            ((media_same++))
+          elif push_file "$serial" "$file" "$REMOTE_MEDIA_ROOT/$rel"; then
+            ((media_copied++))
+            media_copied_files+=("✓ $rel")
+            printf 'MEDIA SYNCED: %s\n' "$rel" >>"$LOG_FILE"
+          else
+            ((media_failed++))
+          fi
+
+          progress_step "미디어 ${media_seen}/${media_total} 처리 완료"
+        done < <(find "$media_dir" -type f -print0)
+
+        # Legion Go S에 없는 원격 미디어 삭제
+        if [[ "$MIRROR_MEDIA" == "1" ]]; then
+          for rel in "${!REMOTE_MEDIA_SIZE[@]}"; do
+            [[ "$rel" == "$system/"* ]] || continue
+            if [[ -z "${LOCAL_MEDIA_PRESENT[$rel]:-}" ]]; then
+              if delete_remote_file "$serial" "$REMOTE_MEDIA_ROOT/$rel"; then
+                ((media_deleted++))
+                media_deleted_files+=("✗ $rel")
+                printf 'MEDIA DELETED: %s\n' "$rel" >>"$LOG_FILE"
+              else
+                ((media_failed++))
+                printf 'MEDIA DELETE FAILED: %s\n' "$rel" >>"$LOG_FILE"
+              fi
+            fi
+          done
+        fi
+
+        unset REMOTE_MEDIA_SIZE LOCAL_MEDIA_PRESENT
+        rm -f "$index_file"
+      fi
+    fi
+  done
+
+  if [[ "$MANAGE_ESDE" == "1" && "$esde_stopped" -eq 1 ]]; then
+    progress_update "$PROGRESS_VALUE" "Pocket Classic의 ES-DE를 다시 실행하고 있습니다…"
+    if start_esde "$serial" "$ESDE_ACTIVITY"; then esde_restarted=1; fi
+    progress_step "ES-DE 재실행 완료"
+  else
+    progress_step "ES-DE 재실행을 건너뜁니다."
+  fi
+
+  progress_close
+
+  local total_failed=$((rom_failed + gl_failed + media_failed))
+  local esde_status="자동 관리 안 함"
+  if [[ "$MANAGE_ESDE" == "1" ]]; then
+    if [[ "$esde_stopped" -eq 1 && "$esde_restarted" -eq 1 ]]; then esde_status="종료 후 재실행 완료"
+    elif [[ "$esde_stopped" -eq 1 ]]; then esde_status="종료됨 / 재실행 실패"
+    else esde_status="종료 실패"
+    fi
+  fi
+
+  local details=""
+  details+="$(append_changes "[ROM 전송]" 20 "${rom_copied_files[@]}")"
+  details+="$(append_changes "[ROM 삭제]" 20 "${rom_deleted_files[@]}")"
+  details+="$(append_changes "[gamelist 전송]" 20 "${gamelist_copied_files[@]}")"
+  details+="$(append_changes "[gamelist 실제 차이]" 30 "${gamelist_diff_reports[@]}")"
+  details+="$(append_changes "[Legion Go S altemulator 지정 게임]" 50 "${altemulator_games[@]}")"
+  details+="$(append_changes "[미디어 전송]" 20 "${media_copied_files[@]}")"
+  details+="$(append_changes "[미디어 삭제]" 20 "${media_deleted_files[@]}")"
+
+  local summary="기기: $manufacturer $model
+동기화 시스템: $SYSTEMS
+ES-DE: $esde_status
+
+[ROM 미러링]
+전송/갱신: ${rom_copied}개
+동일 파일: ${rom_same}개
+원격 삭제: ${rom_deleted}개
+비-ROM 제외: ${ignored}개
+
+[gamelists]
+전송/갱신: ${gl_copied}개
+동일 파일: ${gl_same}개
+altemulator 변환: ${gl_transformed}개
+비-Standalone 제거: ${gl_alt_removed}개
+
+[downloaded_media 미러링]
+전송/갱신: ${media_copied}개
+동일 파일: ${media_same}개
+원격 삭제: ${media_deleted}개
+
+실패: ${total_failed}개${details}
+
+※ ROM은 Legion Go S 기준으로 미러링합니다.
+※ 변경 파일 목록은 항목별 최대 20개까지 표시합니다.
+※ 세이브/상태/메타데이터 파일은 삭제하지 않습니다.
+※ downloaded_media도 Legion Go S 기준으로 미러링합니다.
+※ arcade의 altemulator는 그대로 유지합니다.
+※ 그 외 시스템은 (Standalone)만 유지/변환하고 비-Standalone altemulator는 Android용 사본에서 제거합니다.
+※ gamelist.xml 자체는 변환 후 동기화하며 별도 삭제 대상이 아닙니다."
+
+  if ((total_failed == 0)) && [[ "$esde_restarted" -eq 1 || "$MANAGE_ESDE" != "1" ]]; then
+    notify "$APP_NAME 완료" "$summary"
+  else
+    error "$summary"
+  fi
+}
+
+trap 'progress_close' EXIT
+main "$@"
