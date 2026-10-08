@@ -1,8 +1,8 @@
 {
-  "version": "0.43",
-  "file": "releases/ES-DE-Sync-v0.43.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/ESDE-Sync-for-SteamOS/main/releases/ES-DE-Sync-v0.43.zip",
-  "sha256": "04fea5f853232a12e10358de548eeeddacfa640e07032f93871496edfaea58c0",
-  "notes": "Android 기기별 시스템 기본 에뮬레이터 선택을 보존하도록 gamelist 동기화 개선",
+  "version": "0.44",
+  "file": "releases/ES-DE-Sync-v0.44.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/ESDE-Sync-for-SteamOS/main/releases/ES-DE-Sync-v0.44.zip",
+  "sha256": "3038ce366071fbc76f5f7d84eef52fef422beb4c2639f4564473fcf5750f1302",
+  "notes": "업데이트 저장소 주소와 KDE 메뉴 분류 수정, SteamOS 공개 소스 및 배포 구조 정리. v0.43 동기화 기능 유지.",
   "channel": "stable"
 }
