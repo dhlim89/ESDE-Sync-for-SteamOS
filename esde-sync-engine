@@ -135,15 +135,406 @@ remote_size() {
   adb -s "$serial" shell "stat -c %s '$escaped' 2>/dev/null" </dev/null | tr -d '\r'
 }
 
+remote_shell_quote() {
+  local value="$1"
+  value="${value//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
+remote_sha256_device() {
+  local serial="$1" remote="$2" expected_size="${3:-}"
+  local quoted response marker status before digest after
+  quoted="$(remote_shell_quote "$remote")"
+  # The framed response is authoritative; adb's status may not preserve the
+  # remote shell status. Validate size both before and after hashing.
+  response="$(adb -s "$serial" exec-out "
+    p=$quoted
+    before=\$(stat -c %s \"\$p\" 2>/dev/null) || { printf 'ESDE_HASH_V1 ERROR\\n'; exit 0; }
+    case \"\$before\" in ''|*[!0-9]*) printf 'ESDE_HASH_V1 ERROR\\n'; exit 0;; esac
+    if command -v sha256sum >/dev/null 2>&1; then h=\$(sha256sum \"\$p\" 2>/dev/null); rc=\$?
+    elif command -v toybox >/dev/null 2>&1; then h=\$(toybox sha256sum \"\$p\" 2>/dev/null); rc=\$?
+    else printf 'ESDE_HASH_V1 UNSUPPORTED\\n'; exit 0; fi
+    [ \"\$rc\" -eq 0 ] || { printf 'ESDE_HASH_V1 ERROR\\n'; exit 0; }
+    digest=\${h%% *}
+    case \"\$digest\" in ''|*[!0-9a-fA-F]*) printf 'ESDE_HASH_V1 ERROR\\n'; exit 0;; esac
+    [ \"\${#digest}\" -eq 64 ] || { printf 'ESDE_HASH_V1 ERROR\\n'; exit 0; }
+    after=\$(stat -c %s \"\$p\" 2>/dev/null) || { printf 'ESDE_HASH_V1 ERROR\\n'; exit 0; }
+    [ \"\$before\" = \"\$after\" ] || { printf 'ESDE_HASH_V1 ERROR\\n'; exit 0; }
+    printf 'ESDE_HASH_V1 FILE %s %s %s\\n' \"\$before\" \"\$digest\" \"\$after\"
+  " </dev/null 2>>"$LOG_FILE" | tr -d '\r')" || return 1
+  read -r marker status before digest after extra <<< "$response"
+  [[ "$response" != *$'\n'* && "$marker" == ESDE_HASH_V1 && "$status" == FILE && -z "${extra:-}" ]] || return 1
+  [[ "$before" =~ ^[0-9]+$ && "$before" == "$after" ]] || return 1
+  [[ -z "$expected_size" || "$before" == "$expected_size" ]] || return 1
+  [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  printf '%s\n' "${digest,,}"
+}
+
+remote_sha256_stream() {
+  local serial="$1" remote="$2" expected_size="${3:-}" before after actual digest tmp quoted
+  tmp="$TMP_DIR/remote-rom-${BASHPID}-${RANDOM}.bin"
+  before="$(remote_size "$serial" "$remote")"
+  [[ "$before" =~ ^[0-9]+$ ]] || return 1
+  [[ -z "$expected_size" || "$before" == "$expected_size" ]] || return 1
+  quoted="$(remote_shell_quote "$remote")"
+  # Fallback for Android builds without a usable sha256sum applet. Stream to
+  # disk, then require exact byte count and stable remote size around the read.
+  adb -s "$serial" exec-out "cat $quoted 2>/dev/null" </dev/null >"$tmp" 2>>"$LOG_FILE" || true
+  actual="$(stat -c '%s' "$tmp" 2>/dev/null)"
+  after="$(remote_size "$serial" "$remote")"
+  if [[ ! "$actual" =~ ^[0-9]+$ || "$before" != "$after" || "$actual" != "$before" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  digest="$(local_sha256 "$tmp")" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  printf '%s\n' "$digest"
+}
+
 remote_sha256() {
-  local serial="$1" remote="$2"
-  local escaped="${remote//\'/\'\\\'\'}"
-  adb -s "$serial" exec-out "cat '$escaped' 2>/dev/null" </dev/null | sha256sum | awk '{print $1}'
+  local serial="$1" remote="$2" expected_size="${3:-}" digest
+  digest="$(remote_sha256_device "$serial" "$remote" "$expected_size")" && {
+    printf '%s\n' "$digest"
+    return 0
+  }
+  remote_sha256_stream "$serial" "$remote" "$expected_size"
+}
+
+local_sha256() {
+  local file="$1" output before after
+  before="$(stat -c '%s:%y:%i' -- "$file")" || return 1
+  output="$(sha256sum -- "$file")" || return 1
+  output="${output%% *}"
+  [[ "$output" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  after="$(stat -c '%s:%y:%i' -- "$file")" || return 1
+  [[ "$before" == "$after" ]] || return 1
+  printf '%s\n' "${output,,}"
+}
+
+# Stable names make interrupted work visible on the next run. No artifact ends
+# in a ROM extension. Only the process that exclusively claims the txn may clean it.
+rom_artifact_paths() {
+  local remote="$1" key
+  [[ "$remote" == /* && -n "${remote##*/}" && "${remote##*/}" != . && "${remote##*/}" != .. ]] || return 1
+  key="$(printf '%s' "$remote" | sha256sum)" || return 1
+  key="${key%% *}"
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
+  ROM_FINAL="$remote"
+  ROM_DIR="${remote%/*}"
+  ROM_TXN="$ROM_DIR/.esde-sync-$key.txn"
+  ROM_BACKUP="$ROM_DIR/.esde-sync-$key.backup"
+  ROM_PART="$ROM_DIR/.esde-sync-$key.part"
+  ROM_RESTORE="$ROM_DIR/.esde-sync-$key.restore"
+  ROM_LEGACY_PREFIX="$ROM_DIR/.${remote##*/}.esde-sync-part-"
+}
+
+# All operations carry an exact stdout status. An adb/remote exit code alone is
+# never evidence that an operation succeeded. The heredocs avoid nested host
+# double-quote expansion of Android shell source.
+rom_remote_header() {
+  printf 'p=%s\ndir=%s\ntxn=%s\nbackup=%s\npart=%s\nrestore=%s\nlegacy=%s\n' \
+    "$(remote_shell_quote "$ROM_FINAL")" "$(remote_shell_quote "$ROM_DIR")" \
+    "$(remote_shell_quote "$ROM_TXN")" "$(remote_shell_quote "$ROM_BACKUP")" \
+    "$(remote_shell_quote "$ROM_PART")" "$(remote_shell_quote "$ROM_RESTORE")" \
+    "$(remote_shell_quote "$ROM_LEGACY_PREFIX")"
+}
+
+rom_remote_probe() {
+  local serial="$1" check_pending="${2:-1}" script response
+  script="$(rom_remote_header)
+check_pending=$check_pending
+$(cat <<'SH'
+if [ "$check_pending" = 1 ]; then
+  for f in "$txn" "$backup" "$part" "$restore" "$legacy"*; do
+    if [ -e "$f" ] || [ -L "$f" ]; then printf 'ESDE_ROM_STATE_V1 BUSY\n'; exit 0; fi
+  done
+fi
+if [ -L "$p" ]; then printf 'ESDE_ROM_STATE_V1 ERROR\n'; exit 0; fi
+if [ -e "$p" ]; then
+  if [ ! -f "$p" ]; then printf 'ESDE_ROM_STATE_V1 ERROR\n'; exit 0; fi
+  n=$(stat -c %s "$p" 2>/dev/null)
+  case "$n" in ''|*[!0-9]*) printf 'ESDE_ROM_STATE_V1 ERROR\n'; exit 0;; esac
+  printf 'ESDE_ROM_STATE_V1 FILE %s\n' "$n"
+else
+  ancestor="$dir"
+  while [ ! -e "$ancestor" ]; do
+    if [ -L "$ancestor" ] || [ "$ancestor" = / ]; then printf 'ESDE_ROM_STATE_V1 ERROR\n'; exit 0; fi
+    ancestor=${ancestor%/*}
+    if [ -z "$ancestor" ]; then ancestor=/; fi
+  done
+  if [ ! -d "$ancestor" ] || [ ! -r "$ancestor" ] || [ ! -x "$ancestor" ]; then printf 'ESDE_ROM_STATE_V1 ERROR\n'; exit 0; fi
+  printf 'ESDE_ROM_STATE_V1 MISSING\n'
+fi
+SH
+)"
+  response="$(adb -s "$serial" exec-out "$script" </dev/null 2>>"$LOG_FILE")" || return 1
+  case "$response" in
+    'ESDE_ROM_STATE_V1 MISSING') printf 'MISSING\n' ;;
+    'ESDE_ROM_STATE_V1 BUSY') printf 'BUSY\n' ;;
+    *) if [[ "$response" =~ ^ESDE_ROM_STATE_V1\ FILE\ ([0-9]+)$ ]]; then
+         printf 'FILE %s\n' "${BASH_REMATCH[1]}"
+       else return 1; fi ;;
+  esac
+}
+
+rom_remote_space() {
+  local serial="$1" script
+  script="$(rom_remote_header)
+$(cat <<'SH'
+ancestor="$dir"
+while [ ! -e "$ancestor" ]; do
+  if [ -L "$ancestor" ] || [ "$ancestor" = / ]; then printf 'ESDE_ROM_SPACE_V1 ERROR\n'; exit 0; fi
+  ancestor=${ancestor%/*}
+  if [ -z "$ancestor" ]; then ancestor=/; fi
+ done
+space=$(stat -f -c '%a %S' "$ancestor" 2>/dev/null)
+set -- $space
+if [ "$#" != 2 ]; then printf 'ESDE_ROM_SPACE_V1 ERROR\n'; exit 0; fi
+case "$1:$2" in *[!0-9:]*|:*|*:) printf 'ESDE_ROM_SPACE_V1 ERROR\n'; exit 0;; esac
+printf 'ESDE_ROM_SPACE_V1 %s %s\n' "$1" "$2"
+SH
+)"
+  adb -s "$serial" exec-out "$script" </dev/null 2>>"$LOG_FILE"
+}
+
+rom_remote_action() {
+  local serial="$1" action="$2" script response meta
+  case "$action" in CLAIM|BACKUP|RESTORE_COPY|REPLACE|RESTORE|CLEAN) ;; *) return 1;; esac
+  meta="ESDE_ROM_RECOVERY_V1 $ROM_OLD_SIZE $ROM_OLD_HASH $ROM_NEW_SIZE $ROM_NEW_HASH"
+  script="$(rom_remote_header)
+action=$action
+meta=$(remote_shell_quote "$meta")
+$(cat <<'SH'
+rc=1
+case "$action" in
+  CLAIM)
+    if mkdir -p "$dir" 2>/dev/null; then
+      if mkdir "$txn" 2>/dev/null; then
+        # Never overwrite any prior backup/part, including an orphan without txn.
+        if [ ! -e "$backup" ] && [ ! -L "$backup" ] && [ ! -e "$part" ] && [ ! -L "$part" ] && [ ! -e "$restore" ] && [ ! -L "$restore" ]; then
+          if printf '%s\n' "$meta" > "$txn/old.meta" && printf '%s' "$p" > "$txn/target.path"; then rc=0; fi
+        fi
+      fi
+    fi ;;
+  BACKUP)
+    set -C
+    if cat "$p" > "$backup"; then rc=0; fi ;;
+  RESTORE_COPY)
+    set -C
+    if cat "$backup" > "$restore"; then rc=0; fi ;;
+  REPLACE)
+    if mv -f "$part" "$p"; then rc=0; fi ;;
+  RESTORE)
+    if mv -f "$restore" "$p"; then rc=0; fi ;;
+  CLEAN)
+    if rm -f "$backup" "$part" "$restore"; then
+      if rm -f "$txn/old.meta" "$txn/target.path"; then
+        if rmdir "$txn"; then rc=0; fi
+      fi
+    fi ;;
+esac
+if [ "$rc" = 0 ]; then printf 'ESDE_ROM_OP_V1 %s OK\n' "$action"; else printf 'ESDE_ROM_OP_V1 %s ERROR\n' "$action"; fi
+SH
+)"
+  adb_connection_alive "$serial" || return 1
+  response="$(adb -s "$serial" exec-out "$script" </dev/null 2>>"$LOG_FILE")" || return 1
+  [[ "$response" == "ESDE_ROM_OP_V1 $action OK" ]]
+}
+
+rom_verify_bytes() {
+  local digest
+  digest="$(remote_sha256 "$1" "$2" "$3")" || return 1
+  [[ "$digest" == "$4" ]]
+}
+
+rom_failure() {
+  local serial="$1" status="$2" reason="$3" retain="${4:-0}"
+  if ! adb_connection_alive "$serial"; then
+    status=UNKNOWN
+    retain=1
+    ADB_DISCONNECTED=1
+  fi
+  ROM_REPLACE_STATUS="$status"
+  ROM_RECOVERY_REQUIRED="$retain"
+  ROM_RECOVERY_REPORT="ROM 상태: $status | $ROM_FINAL | $reason"
+  if [[ "$retain" == 1 ]]; then
+    ROM_RECOVERY_REPORT+=$'\n'"수동 확인: backup=$ROM_BACKUP | part=$ROM_PART | restore=$ROM_RESTORE | metadata=$ROM_TXN/old.meta | target=$ROM_TXN/target.path"
+    ROM_RECOVERY_REPORT+=$'\n'"기존 ROM 검증값: size=${ROM_OLD_SIZE:-unknown} sha256=${ROM_OLD_HASH:-unknown}; 기존 파일과 복구 파일을 삭제하지 마세요."
+  fi
+  printf '%s\n' "$ROM_RECOVERY_REPORT" >>"$LOG_FILE"
+  return 1
+}
+
+# Backup is copied, never moved. A failed restore may destroy the destination,
+# but cannot consume the verified backup. Artifacts remain after every failure.
+rom_restore_backup() {
+  local serial="$1"
+  if ! adb_connection_alive "$serial"; then rom_failure "$serial" UNKNOWN '교체 결과 불명; 연결 단절로 복원하지 못함' 1; return 1; fi
+  if rom_verify_bytes "$serial" "$ROM_FINAL" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+    rom_failure "$serial" FAILED_PRESERVED '교체 실패; 기존 ROM 재검증 성공, 백업 보존' 1
+    return 1
+  fi
+  if ! rom_verify_bytes "$serial" "$ROM_BACKUP" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+    rom_failure "$serial" RECOVERY_REQUIRED '백업 재검증 실패; 자동 복원 중단' 1; return 1
+  fi
+  if ! rom_remote_action "$serial" RESTORE_COPY || ! rom_verify_bytes "$serial" "$ROM_RESTORE" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+    rom_failure "$serial" RECOVERY_REQUIRED '복원용 사본 생성/검증 실패; 원본 백업 보존' 1; return 1
+  fi
+  # Verify final bytes even when the mv reply is lost or reports an error.
+  rom_remote_action "$serial" RESTORE || true
+  if ! adb_connection_alive "$serial"; then rom_failure "$serial" UNKNOWN '복원 직후 연결 단절; 복원 결과 불명' 1; return 1; fi
+  if rom_verify_bytes "$serial" "$ROM_FINAL" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+    rom_failure "$serial" FAILED_RESTORED '교체 실패 후 기존 ROM 크기/SHA-256 복원 검증 성공; 백업 보존' 1
+  else
+    rom_failure "$serial" RECOVERY_REQUIRED '복원 후 최종 ROM 검증 실패; 수동 복구 필요, 원본 백업 보존' 1
+  fi
+  return 1
+}
+
+push_rom_verified() {
+  local serial="$1" local_file="$2" remote_file="$3" expected_size="$4" expected_hash="$5"
+  local state old_exists=0 space space_check failure_status=FAILED_PRESERVED
+  ROM_REPLACE_STATUS=FAILED_PRESERVED
+  ROM_RECOVERY_REQUIRED=0
+  ROM_RECOVERY_REPORT=""
+  ROM_OLD_SIZE=unknown; ROM_OLD_HASH=unknown
+  ROM_NEW_SIZE="$expected_size"; ROM_NEW_HASH="$expected_hash"
+  rom_artifact_paths "$remote_file" || return 1
+  [[ "$expected_size" =~ ^[0-9]+$ && "$expected_hash" =~ ^[0-9a-f]{64}$ ]] || { rom_failure "$serial" FAILED_PRESERVED '원본 ROM 검증값 오류'; return 1; }
+  state="$(rom_remote_probe "$serial")" || { rom_failure "$serial" FAILED_PRESERVED '기존 ROM 상태 조회 실패'; return 1; }
+  if [[ "$state" == BUSY ]]; then rom_failure "$serial" PENDING '미완료 트랜잭션/기존 백업 발견; 자동 덮어쓰기 중단' 1; return 1; fi
+  if [[ "$state" == FILE\ * ]]; then
+    old_exists=1; ROM_OLD_SIZE="${state#FILE }"
+    ROM_OLD_HASH="$(remote_sha256 "$serial" "$remote_file" "$ROM_OLD_SIZE")" || { rom_failure "$serial" FAILED_PRESERVED '기존 ROM 해시 검증 실패'; return 1; }
+  else
+    ROM_OLD_SIZE=0; ROM_OLD_HASH=-; failure_status=FAILED_NEW
+  fi
+  space="$(rom_remote_space "$serial")" || { rom_failure "$serial" "$failure_status" '여유 공간 조회 실패'; return 1; }
+  space_check="$(python3 - "$space" "$ROM_OLD_SIZE" "$expected_size" <<'PY'
+import re, sys
+m = re.fullmatch(r'ESDE_ROM_SPACE_V1 ([0-9]+) ([0-9]+)', sys.argv[1])
+if not m or int(m[2]) == 0: raise SystemExit(2)
+available = int(m[1]) * int(m[2])
+old, new = int(sys.argv[2]), int(sys.argv[3])
+# Reserve restore-copy bytes and possible final growth if mv leaves part + final.
+required = 2 * old + new + max(0, new - old) + 1024 * 1024
+print(f'available={available} required={required}')
+raise SystemExit(0 if available >= required else 1)
+PY
+)" || { rom_failure "$serial" "$failure_status" "여유 공간 부족 또는 응답 오류: $space_check"; return 1; }
+  if ! rom_remote_action "$serial" CLAIM; then rom_failure "$serial" PENDING '트랜잭션 독점 확보/메타데이터 기록 실패; 잔재 확인 필요' 1; return 1; fi
+  printf 'ROM TRANSACTION: %s | backup=%s | metadata=%s/old.meta | old_size=%s old_sha256=%s\n' "$remote_file" "$ROM_BACKUP" "$ROM_TXN" "$ROM_OLD_SIZE" "$ROM_OLD_HASH" >>"$LOG_FILE"
+  if [[ "$old_exists" == 1 ]]; then
+    if ! rom_remote_action "$serial" BACKUP || ! rom_verify_bytes "$serial" "$ROM_BACKUP" "$ROM_OLD_SIZE" "$ROM_OLD_HASH" || ! rom_verify_bytes "$serial" "$remote_file" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+      rom_failure "$serial" "$failure_status" '백업 생성/검증 실패; 기존 ROM 변경하지 않음' 1; return 1
+    fi
+  fi
+  if ! adb_connection_alive "$serial" || ! adb -s "$serial" push "$local_file" "$ROM_PART" </dev/null >>"$LOG_FILE" 2>&1; then
+    rom_failure "$serial" "$failure_status" '새 ROM 전송 실패; 원본 경로와 트랜잭션 파일 보존' 1; return 1
+  fi
+  if ! rom_verify_bytes "$serial" "$ROM_PART" "$expected_size" "$expected_hash"; then
+    rom_failure "$serial" "$failure_status" '새 ROM 임시 파일 검증 실패; 원본 경로와 트랜잭션 파일 보존' 1; return 1
+  fi
+  if [[ "$old_exists" == 1 ]]; then
+    if ! rom_verify_bytes "$serial" "$remote_file" "$ROM_OLD_SIZE" "$ROM_OLD_HASH"; then
+      rom_failure "$serial" "$failure_status" '전송 중 기존 ROM 변경/검증 실패; 덮어쓰기 중단' 1; return 1
+    fi
+  else
+    state="$(rom_remote_probe "$serial" 0)" || state=ERROR
+    if [[ "$state" != MISSING ]]; then rom_failure "$serial" "$failure_status" '신규 경로에 파일 발생/상태 불명; 덮어쓰기 중단' 1; return 1; fi
+  fi
+  rom_remote_action "$serial" REPLACE || true
+  if ! adb_connection_alive "$serial"; then rom_failure "$serial" UNKNOWN '교체 직후 연결 단절; 최종 결과 불명, 백업 보존' 1; return 1; fi
+  if rom_verify_bytes "$serial" "$remote_file" "$expected_size" "$expected_hash"; then
+    if ! rom_remote_action "$serial" CLEAN; then rom_failure "$serial" COMMITTED_CLEANUP_FAILED '최종 ROM 검증 성공; 트랜잭션 정리 미완료' 1; return 1; fi
+    ROM_REPLACE_STATUS=SUCCESS
+    printf 'ROM REPLACE SUCCESS (size/SHA-256 verified): %s\n' "$remote_file" >>"$LOG_FILE"
+    return 0
+  fi
+  if [[ "$old_exists" == 1 ]]; then rom_restore_backup "$serial"
+  else rom_failure "$serial" RECOVERY_REQUIRED '신규 ROM 최종 검증 실패; 복원할 기존 ROM 없음, 파일 보존' 1; fi
+  return 1
+}
+
+# Scan directories as well as files: a kill immediately after mkdir may leave
+# an empty txn that the regular file index cannot see. Never auto-resolve it.
+rom_pending_transactions() {
+  local serial="$1" remote_dir="$2" script response result rc
+  response="$TMP_DIR/rom-pending-${BASHPID}-${RANDOM}.bin"
+  script="p=$(remote_shell_quote "$remote_dir")
+$(cat <<'SH'
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf 'ESDE_ROM_PENDING_V1 EMPTY\n'; exit 0; fi
+if [ ! -d "$p" ] || [ ! -r "$p" ] || [ ! -x "$p" ]; then printf 'ESDE_ROM_PENDING_V1 ERROR\n'; exit 0; fi
+printf 'ESDE_ROM_PENDING_V1 BEGIN\n'
+find "$p" \( -name '.esde-sync-*' -o -name '.*.esde-sync-part-*' \) -exec sh -c '
+  n=$(printf "%s" "$1" | wc -c | tr -d "[:space:]")
+  case "$n" in ""|*[!0-9]*) printf "ERROR\n"; exit 0;; esac
+  printf "P %s\n" "$n"
+  printf "%s" "$1"
+' sh {} \; 2>/dev/null
+rc=$?
+if [ "$rc" = 0 ]; then printf 'ESDE_ROM_PENDING_V1 END\n'; else printf 'ESDE_ROM_PENDING_V1 ERROR\n'; fi
+SH
+)"
+  adb -s "$serial" exec-out "$script" </dev/null >"$response" 2>>"$LOG_FILE" || true
+  result="$(python3 - "$response" "$remote_dir/" <<'PY'
+import json, os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+if raw == b'ESDE_ROM_PENDING_V1 EMPTY\n':
+    print('[]'); raise SystemExit(0)
+start, end = b'ESDE_ROM_PENDING_V1 BEGIN\n', b'ESDE_ROM_PENDING_V1 END\n'
+if not raw.startswith(start): raise SystemExit(2)
+pos, paths = len(start), []
+while raw[pos:] != end:
+    nl = raw.find(b'\n', pos, pos + 128)
+    if nl < 0: raise SystemExit(2)
+    m = re.fullmatch(rb'P ([0-9]+)', raw[pos:nl])
+    if not m: raise SystemExit(2)
+    n = int(m[1]); pos = nl + 1
+    path = raw[pos:pos+n]; pos += n
+    if n == 0 or len(path) != n or b'\0' in path or not path.startswith(os.fsencode(sys.argv[2])) or path in paths: raise SystemExit(2)
+    paths.append(path)
+print(json.dumps([os.fsdecode(p) for p in paths], ensure_ascii=False))
+raise SystemExit(1 if paths else 0)
+PY
+)"; rc=$?
+  rm -f "$response"
+  printf '%s\n' "$result"
+  return "$rc"
+}
+
+# Return codes: 0 = identical, 1 = upload/update required, 2 = unverifiable.
+# ROM_LOCAL_HASH and ROM_LOCAL_SIZE contain the stable local snapshot metadata.
+rom_compare() {
+  local serial="$1" local_file="$2" remote_file="$3" remote_file_size="$4" local_size remote_hash
+  local state
+  ROM_RECOVERY_REQUIRED=0
+  ROM_RECOVERY_REPORT=""
+  ROM_OLD_SIZE=unknown; ROM_OLD_HASH=unknown
+  rom_artifact_paths "$remote_file" || return 2
+  state="$(rom_remote_probe "$serial")" || {
+    rom_failure "$serial" FAILED_PRESERVED 'ROM 교체 잔재/상태 확인 실패'
+    return 2
+  }
+  if [[ "$state" == BUSY ]]; then
+    rom_failure "$serial" PENDING '미완료 트랜잭션/기존 백업 발견; 동일 ROM도 건너뛰지 않고 중단' 1
+    return 2
+  fi
+  local_size="$(stat -c '%s' -- "$local_file")" || return 2
+  ROM_LOCAL_HASH="$(local_sha256 "$local_file")" || return 2
+  ROM_LOCAL_SIZE="$local_size"
+  if [[ -z "$remote_file_size" || "$remote_file_size" != "$local_size" ]]; then
+    return 1
+  fi
+  remote_hash="$(remote_sha256 "$serial" "$remote_file" "$remote_file_size")" || return 2
+  [[ "$ROM_LOCAL_HASH" == "$remote_hash" ]] && return 0
+  return 1
 }
 
 push_file() {
   local serial="$1" local_file="$2" remote_file="$3"
   adb -s "$serial" shell mkdir -p "$(dirname "$remote_file")" </dev/null >>"$LOG_FILE" 2>&1 || return 1
+  adb_connection_alive "$serial" || return 1
   adb -s "$serial" push "$local_file" "$remote_file" </dev/null >>"$LOG_FILE" 2>&1
 }
 
@@ -153,13 +544,64 @@ delete_remote_file() {
   adb -s "$serial" shell "rm -f '$escaped'" </dev/null >>"$LOG_FILE" 2>&1
 }
 
+validate_runtime_path_map() {
+  local serial="$1" map_file="$2" systems="$3"
+  [[ -e "$map_file" || -L "$map_file" ]] || return 0
+  python3 - "$serial" "$map_file" "$systems" >>"$LOG_FILE" 2>&1 <<'PY'
+import json, pathlib, re, sys
+
+serial, filename, configured_systems = sys.argv[1:4]
+path = pathlib.Path(filename)
+try:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("매핑 경로는 일반 파일이어야 합니다.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or set(data) != {"schema_version", "device_serial", "systems"}:
+        raise ValueError("최상위 스키마 키가 잘못되었습니다.")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("지원하지 않는 schema_version입니다.")
+    if not isinstance(data["device_serial"], str) or data["device_serial"] != serial:
+        raise ValueError("매핑 device_serial이 현재 기기와 다릅니다.")
+    if not isinstance(data["systems"], dict):
+        raise ValueError("systems는 객체여야 합니다.")
+    enabled = set(configured_systems.split())
+    if not set(data["systems"]).issubset(enabled):
+        raise ValueError("현재 프로필에 없는 시스템의 매핑이 포함되어 있습니다.")
+    for system, rows in data["systems"].items():
+        if not isinstance(system, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", system):
+            raise ValueError("시스템 키가 잘못되었습니다.")
+        if not isinstance(rows, list):
+            raise ValueError(f"{system}: 매핑은 배열이어야 합니다.")
+        sources, destinations = set(), set()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"from", "to"}:
+                raise ValueError(f"{system}: 매핑 항목 스키마가 잘못되었습니다.")
+            old, new = row["from"], row["to"]
+            for label, value in (("from", old), ("to", new)):
+                if not isinstance(value, str) or not value.startswith("./") or value == "./" or value != value.strip() or "\0" in value:
+                    raise ValueError(f"{system}: {label} 경로가 잘못되었습니다.")
+            if old == new:
+                raise ValueError(f"{system}: from과 to가 같습니다.")
+            if old in sources or new in destinations:
+                raise ValueError(f"{system}: from/to 중복 또는 다대일·일대다 매핑입니다.")
+            sources.add(old)
+            destinations.add(new)
+        if sources & destinations:
+            raise ValueError(f"{system}: 연쇄 또는 순환 매핑은 허용되지 않습니다.")
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+    print(f"RUNTIME PATH MAP INVALID: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 transform_gamelist() {
-  local input="$1" output="$2" mapping="$3" count_file="$4" system="$5" removed_file="$6" remote_input="${7:-}"
-  python3 - "$input" "$output" "$mapping" "$count_file" "$system" "$removed_file" "$remote_input" >>"$LOG_FILE" 2>&1 <<'PY'
+  local input="$1" output="$2" mapping="$3" count_file="$4" system="$5" removed_file="$6" remote_input="${7:-}" runtime_map_file="${8:-}" serial="${9:-}"
+  python3 - "$input" "$output" "$mapping" "$count_file" "$system" "$removed_file" "$remote_input" "$runtime_map_file" "$serial" >>"$LOG_FILE" 2>&1 <<'PY'
 import sys, re, copy
+import json, pathlib
 import xml.etree.ElementTree as ET
 
-src, dst, mapping_text, count_file, system, removed_file, remote_input = sys.argv[1:8]
+src, dst, mapping_text, count_file, system, removed_file, remote_input, runtime_map_file, serial = sys.argv[1:10]
 
 mapping = {}
 if mapping_text.strip():
@@ -198,6 +640,43 @@ def field_bytes(field):
     field = copy.deepcopy(field)
     field.tail = None
     return ET.tostring(field, encoding="utf-8")
+
+
+def runtime_path_mappings(filename, selected_serial, selected_system):
+    if not filename:
+        return []
+    path = pathlib.Path(filename)
+    if not path.exists() and not path.is_symlink():
+        return []
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("runtime path mapping은 일반 파일이어야 합니다.")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or set(data) != {"schema_version", "device_serial", "systems"}:
+        raise ValueError("runtime path mapping 최상위 스키마가 잘못되었습니다.")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("지원하지 않는 runtime path mapping schema_version입니다.")
+    if not isinstance(data["device_serial"], str) or data["device_serial"] != selected_serial:
+        raise ValueError("runtime path mapping serial이 현재 기기와 다릅니다.")
+    systems = data["systems"]
+    if not isinstance(systems, dict):
+        raise ValueError("runtime path mapping systems가 객체가 아닙니다.")
+    if selected_system not in systems:
+        return []
+    rows = systems[selected_system]
+    if not isinstance(rows, list):
+        raise ValueError("runtime path mapping 시스템 항목이 배열이 아닙니다.")
+    result, sources, destinations = [], set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"from", "to"}:
+            raise ValueError("runtime path mapping 항목 스키마가 잘못되었습니다.")
+        old, new = row["from"], row["to"]
+        for label, value in (("from", old), ("to", new)):
+            if not isinstance(value, str) or not value.startswith("./") or value == "./" or value != value.strip() or "\0" in value:
+                raise ValueError(f"runtime path mapping {label} 경로가 잘못되었습니다.")
+        if old == new or old in sources or new in destinations or old in destinations or new in sources:
+            raise ValueError("runtime path mapping이 중복·다대일·일대다·연쇄 관계입니다.")
+        sources.add(old); destinations.add(new); result.append((old, new))
+    return result
 
 
 master = parse_fragments(text)
@@ -247,6 +726,42 @@ if remote_input:
             field.tail = tail
             game.insert(position, field)
             runtime_merged = True
+    # A rename migration copies only Android runtime fields. The path and all
+    # descriptive metadata continue to come from the SteamOS master gamelist.
+    for old_path, new_path in runtime_path_mappings(runtime_map_file, serial, system):
+        old_game = android_games.get(old_path)
+        # An absent source is normal after a successful prior migration. A
+        # source still present in SteamOS is not treated as a rename.
+        if old_game is None or old_path in master_games:
+            continue
+        new_game = master_games.get(new_path)
+        if new_game is None:
+            raise ValueError(f"runtime path mapping 대상이 SteamOS gamelist에 없습니다: {new_path!r}")
+        destination_android = android_games.get(new_path)
+        for tag in ("playcount", "playtime", "lastplayed"):
+            old_fields = old_game.findall(tag)
+            if len(old_fields) > 1:
+                raise ValueError(f"이전 경로의 Android runtime 태그가 중복되었습니다: {old_path!r} {tag}")
+            if not old_fields:
+                continue
+            destination_fields = destination_android.findall(tag) if destination_android is not None else []
+            if len(destination_fields) > 1:
+                raise ValueError(f"대상 경로의 Android runtime 태그가 중복되었습니다: {new_path!r} {tag}")
+            if destination_fields:
+                if field_bytes(destination_fields[0]) != field_bytes(old_fields[0]):
+                    raise ValueError(f"runtime path mapping 충돌: {old_path!r} -> {new_path!r} <{tag}>")
+                continue
+            legion_fields = new_game.findall(tag)
+            if len(legion_fields) > 1:
+                raise ValueError(f"SteamOS 대상 runtime 태그가 중복되었습니다: {new_path!r} {tag}")
+            position = list(new_game).index(legion_fields[0]) if legion_fields else len(new_game)
+            tail = legion_fields[0].tail if legion_fields else old_fields[0].tail
+            for field in legion_fields:
+                new_game.remove(field)
+            migrated = copy.deepcopy(old_fields[0])
+            migrated.tail = tail
+            new_game.insert(position, migrated)
+            runtime_merged = True
     # Android-only games are intentionally never appended to the master tree.
     if runtime_merged or system_default_merged:
         text = "".join(ET.tostring(child, encoding="unicode", short_empty_elements=False) for child in list(master))
@@ -293,27 +808,67 @@ PY
 }
 
 read_remote_gamelist() {
-  local serial="$1" remote="$2" output="$3" escaped status
-  escaped="${remote//\'/\'\\\'\'}"
-  # Exit 3 explicitly means missing; transport/read errors must never become
-  # permission to overwrite Android runtime history with the master file.
-  if adb -s "$serial" exec-out "
-    if [ -f '$escaped' ]; then
-      cat '$escaped'
-    elif [ ! -e '$escaped' ]; then
-      exit 3
-    else
-      exit 1
+  local serial="$1" remote="$2" output="$3" response quoted parsed
+  response="$TMP_DIR/gamelist-response-${BASHPID}-${RANDOM}.bin"
+  quoted="$(remote_shell_quote "$remote")"
+  # Status is carried in stdout; do not infer it from adb's remote exit code.
+  adb -s "$serial" exec-out "
+    p=$quoted
+    if [ ! -e \"\$p\" ]; then
+      [ ! -L \"\$p\" ] || { printf 'ESDE_GL_V1 ERROR\\n'; exit 0; }
+      parent=\${p%/*}
+      if [ -e \"\$parent\" ]; then
+        [ -d \"\$parent\" ] && [ -r \"\$parent\" ] && [ -x \"\$parent\" ] || { printf 'ESDE_GL_V1 ERROR\\n'; exit 0; }
+      fi
+      printf 'ESDE_GL_V1 MISSING\\n'; exit 0
     fi
-  " </dev/null > "$output" 2>>"$LOG_FILE"; then
-    return 0
-  else
-    status=$?
-    rm -f "$output"
-    [[ "$status" == "3" ]] && return 0
-    printf 'GAMELIST READ FAILED: %s\n' "$remote" >>"$LOG_FILE"
-    return 1
-  fi
+    if [ ! -f \"\$p\" ]; then printf 'ESDE_GL_V1 ERROR\\n'; exit 0; fi
+    n=\$(stat -c %s \"\$p\" 2>/dev/null) || { printf 'ESDE_GL_V1 ERROR\\n'; exit 0; }
+    case \"\$n\" in ''|*[!0-9]*) printf 'ESDE_GL_V1 ERROR\\n'; exit 0;; esac
+    [ \"\$n\" != 0 ] || { printf 'ESDE_GL_V1 EMPTY\\n'; exit 0; }
+    printf 'ESDE_GL_V1 FILE %s\\n' \"\$n\"
+    cat \"\$p\" || exit 0
+    printf '\\nESDE_GL_V1_END\\n'
+  " </dev/null >"$response" 2>>"$LOG_FILE" || true
+  parsed="$(python3 - "$response" "$output" <<'PY'
+import pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+missing = b"ESDE_GL_V1 MISSING\n"
+if raw == missing:
+    pathlib.Path(sys.argv[2]).unlink(missing_ok=True)
+    print("MISSING")
+    raise SystemExit(0)
+if raw == b"ESDE_GL_V1 EMPTY\n":
+    print("EMPTY")
+    raise SystemExit(0)
+if raw == b"ESDE_GL_V1 ERROR\n":
+    print("ERROR")
+    raise SystemExit(0)
+match = re.match(rb"ESDE_GL_V1 FILE ([0-9]+)\n", raw)
+if not match:
+    print("ERROR")
+    raise SystemExit(0)
+size = int(match.group(1))
+payload_start = match.end()
+trailer = b"\nESDE_GL_V1_END\n"
+payload_end = payload_start + size
+if size == 0:
+    print("EMPTY")
+    raise SystemExit(0)
+if len(raw) != payload_end + len(trailer) or raw[payload_end:] != trailer:
+    print("ERROR")
+    raise SystemExit(0)
+pathlib.Path(sys.argv[2]).write_bytes(raw[payload_start:payload_end])
+print("FILE")
+PY
+)"
+  rm -f "$response"
+  case "$parsed" in
+    MISSING) rm -f "$output"; return 0 ;;
+    FILE) return 0 ;;
+    EMPTY|ERROR) rm -f "$output"; printf 'GAMELIST READ %s: %s\n' "$parsed" "$remote" >>"$LOG_FILE"; return 1 ;;
+    *) rm -f "$output"; printf 'GAMELIST READ INVALID RESPONSE: %s\n' "$remote" >>"$LOG_FILE"; return 1 ;;
+  esac
 }
 
 xml_semantic_equal() {
@@ -512,24 +1067,87 @@ start_esde() {
   adb -s "$serial" shell am start -n "$activity" </dev/null >>"$LOG_FILE" 2>&1
 }
 
+adb_connection_alive() {
+  local state
+  state="$(adb -s "$1" get-state </dev/null 2>/dev/null | tr -d '\r')" || return 1
+  [[ "$state" == "device" ]]
+}
+
 build_remote_index() {
   local serial="$1" system="$2" remote_root="$3" out="$4"
-  local remote_dir="$remote_root/$system"
-  local escaped="${remote_dir//\'/\'\\\'\'}"
-
-  adb -s "$serial" shell "
-    if [ -d '$escaped' ]; then
-      find '$escaped' -type f -exec stat -c '%n	%s' {} \;
+  local remote_dir="$remote_root/$system" response quoted
+  response="$out.response"
+  quoted="$(remote_shell_quote "$remote_dir")"
+  adb -s "$serial" exec-out "
+    p=$quoted
+    if [ ! -e \"\$p\" ]; then
+      parent=\${p%/*}
+      if [ -e \"\$parent\" ]; then
+        if [ ! -d \"\$parent\" ] || [ ! -r \"\$parent\" ] || [ ! -x \"\$parent\" ]; then
+          printf 'ESDE_INDEX_V2 ERROR\\n'; exit 0
+        fi
+      fi
+      printf 'ESDE_INDEX_V2 MISSING\\n'; exit 0
     fi
-  " </dev/null 2>>"$LOG_FILE" | tr -d '\r' > "$out.raw"
-
-  awk -F '\t' -v root="$remote_root/" 'BEGIN{OFS="\t"} {
-    path=$1
-    sub("^" root, "", path)
-    print path, $2
-  }' "$out.raw" > "$out"
-
-  rm -f "$out.raw"
+    if [ ! -d \"\$p\" ] || [ ! -r \"\$p\" ] || [ ! -x \"\$p\" ]; then printf 'ESDE_INDEX_V2 ERROR\\n'; exit 0; fi
+    printf 'ESDE_INDEX_V2 BEGIN\\n'
+    find \"\$p\" -type f -exec sh -c '
+      f=\$1
+      size=\$(stat -c %s \"\$f\" 2>/dev/null)
+      if [ \$? -ne 0 ]; then printf \"ESDE_INDEX_V2 ITEM_ERROR\\n\"; exit 0; fi
+      case \$size in \"\"|*[!0-9]*) printf \"ESDE_INDEX_V2 ITEM_ERROR\\n\"; exit 0;; esac
+      length=\$(printf \"%s\" \"\$f\" | wc -c | tr -d \"[:space:]\")
+      if [ \$? -ne 0 ]; then printf \"ESDE_INDEX_V2 ITEM_ERROR\\n\"; exit 0; fi
+      case \$length in \"\"|*[!0-9]*) printf \"ESDE_INDEX_V2 ITEM_ERROR\\n\"; exit 0;; esac
+      printf \"F %s %s\\n\" \"\$length\" \"\$size\"
+      printf \"%s\" \"\$f\"
+    ' sh {} \\; 2>/dev/null
+    rc=\$?
+    if [ \"\$rc\" -eq 0 ]; then printf 'ESDE_INDEX_V2 END\\n'; else printf 'ESDE_INDEX_V2 ERROR\\n'; fi
+  " </dev/null >"$response" 2>>"$LOG_FILE" || true
+  if ! python3 - "$response" "$out" "$remote_root/" <<'PY'
+import os, pathlib, re, sys
+raw = pathlib.Path(sys.argv[1]).read_bytes()
+out = pathlib.Path(sys.argv[2])
+prefix = os.fsencode(sys.argv[3])
+rows, seen = [], set()
+if raw == b"ESDE_INDEX_V2 MISSING\n":
+    out.write_bytes(b"")
+    raise SystemExit(0)
+start = b"ESDE_INDEX_V2 BEGIN\n"
+if not raw.startswith(start): raise SystemExit(1)
+pos = len(start)
+while True:
+    nl = raw.find(b"\n", pos, min(len(raw), pos + 128))
+    if nl < 0: raise SystemExit(1)
+    header = raw[pos:nl]
+    if header == b"ESDE_INDEX_V2 END":
+        pos = nl + 1
+        break
+    match = re.fullmatch(rb"F ([0-9]+) ([0-9]+)", header)
+    if not match: raise SystemExit(1)
+    path_len, size = int(match.group(1)), match.group(2)
+    if path_len < 1 or path_len > 16 * 1024 * 1024: raise SystemExit(1)
+    pos = nl + 1
+    end = pos + path_len
+    if end > len(raw): raise SystemExit(1)
+    path = raw[pos:end]
+    if not path.startswith(prefix) or len(path) == len(prefix) or b"\0" in path: raise SystemExit(1)
+    rel = path[len(prefix):]
+    if rel in seen: raise SystemExit(1)
+    seen.add(rel)
+    rows.append(rel + b"\0" + size + b"\0")
+    pos = end
+if pos != len(raw): raise SystemExit(1)
+out.write_bytes(b"".join(rows))
+PY
+  then
+    rm -f "$response" "$out"
+    printf 'REMOTE INDEX INVALID: %s\n' "$remote_dir" >>"$LOG_FILE"
+    return 1
+  fi
+  rm -f "$response"
+  return 0
 }
 
 append_changes() {
@@ -604,12 +1222,20 @@ main() {
   ALTEMU_MAP_GB="${ALTEMU_MAP_GB//SameBoy (Standalone)/Sameboy (Standalone)}"
   ALTEMU_MAP_GBC="${ALTEMU_MAP_GBC//SameBoy (Standalone)/Sameboy (Standalone)}"
 
+  local runtime_map_file="$PROFILE_DIR/${safe_serial}.runtime-map.json"
+  if ! validate_runtime_path_map "$serial" "$runtime_map_file" "$SYSTEMS"; then
+    printf 'RUNTIME PATH MAP INVALID; no remote changes started: %s\n' "$runtime_map_file" >>"$LOG_FILE"
+    error "기기별 runtime 경로 매핑 파일이 잘못되었습니다: $runtime_map_file"
+    exit 1
+  fi
+
   local rom_copied=0 rom_same=0 rom_failed=0 rom_deleted=0 ignored=0
   local gl_copied=0 gl_same=0 gl_failed=0 gl_transformed=0 gl_alt_removed=0
   local media_copied=0 media_same=0 media_failed=0 media_deleted=0 media_total=0 media_seen=0
   local system file rel rsize mapping
-  local local_gl remote_gl temp_gl remote_temp_gl diff_file alt_list_file count_file removed_file changed removed lhash rhash
-  local media_dir index_file rom_index_file
+  local media_index_ok
+  local local_gl remote_gl temp_gl remote_temp_gl diff_file alt_list_file count_file removed_file changed removed rom_index_ok
+  local media_dir index_file rom_index_file local_rom_index local_media_index
   local -a rom_copied_files=()
   local -a rom_deleted_files=()
   local -a gamelist_copied_files=()
@@ -617,6 +1243,9 @@ main() {
   local -a altemulator_games=()
   local -a media_copied_files=()
   local -a media_deleted_files=()
+  local -a rom_recovery_reports=()
+  local rom_abort=0
+  ADB_DISCONNECTED=0
 
   local total_work=2
   for system in $SYSTEMS; do
@@ -635,24 +1264,67 @@ main() {
 
   if [[ "$MANAGE_ESDE" == "1" && "$SYNC_GAMELISTS" == "1" ]]; then
     progress_update "$PROGRESS_VALUE" "Pocket Classic의 ES-DE를 잠시 종료하고 있습니다…"
-    if stop_esde "$serial" "$ESDE_PACKAGE"; then esde_stopped=1; fi
+    if stop_esde "$serial" "$ESDE_PACKAGE"; then esde_stopped=1
+    elif ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED while stopping ES-DE\n' >>"$LOG_FILE"; fi
     progress_step "ES-DE 종료 완료"
   else
     progress_step "ES-DE 자동 관리를 건너뜁니다."
   fi
 
   for system in $SYSTEMS; do
-    rom_index_file="$TMP_DIR/remote-rom-${safe_serial}-${system}.tsv"
-    build_remote_index "$serial" "$system" "$REMOTE_ROM_ROOT" "$rom_index_file"
+    [[ "${ADB_DISCONNECTED:-0}" == "0" ]] || break
+    [[ "$rom_abort" == 0 ]] || break
+    local system_sync_ok=1
+    local_rom_index="$TMP_DIR/local-rom-${safe_serial}-${system}.nul"
+    : > "$local_rom_index"
+    local local_rom_dir="$LOCAL_ROM_ROOT/$system"
+    if [[ -L "$local_rom_dir" || ! -d "$local_rom_dir" || ! -r "$local_rom_dir" || ! -x "$local_rom_dir" ]]; then
+      ((rom_failed++))
+      rom_recovery_reports+=("로컬 ROM 원본 경로가 없거나 디렉터리가 아니거나 읽을 수 없습니다: $local_rom_dir; 시스템 ROM/gamelist/media 변경 중단")
+      printf '%s\n' "${rom_recovery_reports[@]}" >>"$LOG_FILE"
+      rm -f "$local_rom_index"
+      continue
+    fi
+    if ! find "$local_rom_dir" -type f -print0 >"$local_rom_index" 2>>"$LOG_FILE"; then
+      ((rom_failed++))
+      rom_recovery_reports+=("로컬 ROM 목록 조회 실패: $local_rom_dir; 시스템 ROM/gamelist/media 변경 중단")
+      printf '%s\n' "${rom_recovery_reports[@]}" >>"$LOG_FILE"
+      rm -f "$local_rom_index"
+      continue
+    fi
+    rom_index_file="$TMP_DIR/remote-rom-${safe_serial}-${system}.idx"
+    rom_index_ok=1
+    if ! build_remote_index "$serial" "$system" "$REMOTE_ROM_ROOT" "$rom_index_file"; then
+      rom_index_ok=0
+      system_sync_ok=0
+      ((rom_failed++))
+      printf 'SYSTEM SYNC BLOCKED: %s; ROM index is incomplete or invalid\n' "$system" >>"$LOG_FILE"
+      if ! adb_connection_alive "$serial"; then
+        ADB_DISCONNECTED=1
+        printf 'ADB DISCONNECTED after ROM index failure: %s\n' "$system" >>"$LOG_FILE"
+      fi
+    fi
+
+    if [[ "$rom_index_ok" == 1 ]]; then
+      local pending_report
+      if ! pending_report="$(rom_pending_transactions "$serial" "$REMOTE_ROM_ROOT/$system")"; then
+        system_sync_ok=0; rom_abort=1; ((rom_failed++))
+        rom_recovery_reports+=("ROM 미완료 트랜잭션 또는 조회 오류: $REMOTE_ROM_ROOT/$system | $pending_report; 자동 변경 중단, 복구 파일 보존")
+        printf '%s\n' "${rom_recovery_reports[@]}" >>"$LOG_FILE"
+        if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; fi
+      fi
+    fi
 
     declare -A REMOTE_ROM_SIZE=()
     declare -A LOCAL_ROM_PRESENT=()
 
-    while IFS=$'\t' read -r rel rsize; do
-      [[ -n "$rel" ]] && REMOTE_ROM_SIZE["$rel"]="$rsize"
-    done < "$rom_index_file"
+    if [[ "$rom_index_ok" == "1" ]]; then
+      while IFS= read -r -d '' rel && IFS= read -r -d '' rsize; do
+        REMOTE_ROM_SIZE["$rel"]="$rsize"
+      done < "$rom_index_file"
+    fi
 
-    if [[ -d "$LOCAL_ROM_ROOT/$system" ]]; then
+    if [[ "$rom_index_ok" == "1" && "$system_sync_ok" == 1 && -d "$LOCAL_ROM_ROOT/$system" ]]; then
       while IFS= read -r -d '' file; do
         if ! is_rom_file "$file"; then ((ignored++)); continue; fi
 
@@ -660,42 +1332,75 @@ main() {
         LOCAL_ROM_PRESENT["$rel"]=1
         progress_update "$PROGRESS_VALUE" "ROM 검사: $rel"
 
-        local lsize
-        lsize="$(stat -c '%s' "$file")"
         rsize="${REMOTE_ROM_SIZE[$rel]:-}"
-
-        if [[ -n "$rsize" && "$rsize" == "$lsize" ]]; then
+        if rom_compare "$serial" "$file" "$REMOTE_ROM_ROOT/$rel" "$rsize"; then
           ((rom_same++))
-        elif push_file "$serial" "$file" "$REMOTE_ROM_ROOT/$rel"; then
+          progress_step "ROM 동일: $rel"
+          continue
+        else
+          local compare_status=$?
+          if [[ "$compare_status" -eq 2 ]]; then
+            ((rom_failed++))
+            printf 'ROM HASH VERIFICATION FAILED: %s\n' "$rel" >>"$LOG_FILE"
+            progress_step "ROM 해시 검증 실패: $rel"
+            if [[ "${ROM_RECOVERY_REQUIRED:-0}" == 1 ]]; then
+              rom_recovery_reports+=("$ROM_RECOVERY_REPORT")
+              system_sync_ok=0; rom_abort=1
+              break
+            fi
+            if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED during ROM hash: %s\n' "$rel" >>"$LOG_FILE"; break; fi
+            continue
+          fi
+        fi
+
+        if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; ((rom_failed++)); printf 'ADB DISCONNECTED before ROM update: %s\n' "$rel" >>"$LOG_FILE"; break; fi
+        if push_rom_verified "$serial" "$file" "$REMOTE_ROM_ROOT/$rel" "$ROM_LOCAL_SIZE" "$ROM_LOCAL_HASH"; then
           ((rom_copied++))
           rom_copied_files+=("✓ $rel")
           printf 'ROM SYNCED: %s\n' "$rel" >>"$LOG_FILE"
         else
           ((rom_failed++))
+          system_sync_ok=0
+          rom_recovery_reports+=("${ROM_RECOVERY_REPORT:-ROM 교체 실패: $rel}")
+          [[ "${ROM_RECOVERY_REQUIRED:-0}" == 1 ]] && rom_abort=1
+          if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED during ROM update: %s\n' "$rel" >>"$LOG_FILE"; break; fi
+          break
         fi
         progress_step "ROM 처리 완료: $rel"
-      done < <(find "$LOCAL_ROM_ROOT/$system" -type f -print0)
+      done < "$local_rom_index"
     fi
 
-    if [[ "$MIRROR_ROMS" == "1" ]]; then
+    if [[ "$rom_index_ok" == "1" && "$system_sync_ok" == 1 && "$MIRROR_ROMS" == "1" && "$ADB_DISCONNECTED" != "1" ]]; then
       for rel in "${!REMOTE_ROM_SIZE[@]}"; do
         [[ "$rel" == "$system/"* ]] || continue
         if [[ -z "${LOCAL_ROM_PRESENT[$rel]:-}" ]] && is_rom_file "$rel"; then
+          rom_artifact_paths "$REMOTE_ROM_ROOT/$rel"
+          ROM_OLD_SIZE=unknown; ROM_OLD_HASH=unknown
+          local delete_state
+          delete_state="$(rom_remote_probe "$serial")" || delete_state=ERROR
+          if [[ "$delete_state" == BUSY || "$delete_state" == ERROR ]]; then
+            ((rom_failed++)); system_sync_ok=0; rom_abort=1
+            rom_failure "$serial" PENDING 'ROM 삭제 전 미완료 트랜잭션/상태 오류; 삭제 차단' 1 || true
+            rom_recovery_reports+=("$ROM_RECOVERY_REPORT")
+            break
+          fi
+          if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; ((rom_failed++)); printf 'ADB DISCONNECTED before ROM delete: %s\n' "$rel" >>"$LOG_FILE"; break; fi
           if delete_remote_file "$serial" "$REMOTE_ROM_ROOT/$rel"; then
             ((rom_deleted++))
             rom_deleted_files+=("✗ $rel")
             printf 'ROM DELETED: %s\n' "$rel" >>"$LOG_FILE"
           else
             ((rom_failed++))
+            if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED during ROM delete: %s\n' "$rel" >>"$LOG_FILE"; break; fi
           fi
         fi
       done
     fi
 
     unset REMOTE_ROM_SIZE LOCAL_ROM_PRESENT
-    rm -f "$rom_index_file"
+    rm -f "$rom_index_file" "$local_rom_index"
 
-    if [[ "$SYNC_GAMELISTS" == "1" ]]; then
+    if [[ "$system_sync_ok" == "1" && "$ADB_DISCONNECTED" != "1" && "$SYNC_GAMELISTS" == "1" ]]; then
       local_gl="$LOCAL_GAMELIST_ROOT/$system/gamelist.xml"
       remote_gl="$REMOTE_GAMELIST_ROOT/$system/gamelist.xml"
       if [[ -f "$local_gl" ]]; then
@@ -718,7 +1423,7 @@ main() {
         # Snapshot Legion first; only this Android-bound working copy is merged.
         if cp "$local_gl" "$master_temp_gl" && read_remote_gamelist "$serial" "$remote_gl" "$remote_temp_gl"; then
           [[ -f "$remote_temp_gl" ]] && merge_remote="$remote_temp_gl"
-          if transform_gamelist "$master_temp_gl" "$temp_gl" "$mapping" "$count_file" "$system" "$removed_file" "$merge_remote"; then
+          if transform_gamelist "$master_temp_gl" "$temp_gl" "$mapping" "$count_file" "$system" "$removed_file" "$merge_remote" "$runtime_map_file" "$serial"; then
             changed="$(cat "$count_file" 2>/dev/null || printf '0')"
             removed="$(cat "$removed_file" 2>/dev/null || printf '0')"
             [[ "$changed" =~ ^[0-9]+$ ]] || changed=0
@@ -751,12 +1456,14 @@ main() {
                 rm -f "$diff_file"
               fi
 
-              if push_file "$serial" "$temp_gl" "$remote_gl"; then
+              if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; ((gl_failed++)); printf 'ADB DISCONNECTED before gamelist update: %s\n' "$system" >>"$LOG_FILE"
+              elif push_file "$serial" "$temp_gl" "$remote_gl"; then
                 ((gl_copied++))
                 gamelist_copied_files+=("✓ $system/gamelist.xml")
                 printf 'GAMELIST SYNCED: %s/gamelist.xml\n' "$system" >>"$LOG_FILE"
               else
                 ((gl_failed++))
+                if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED during gamelist update: %s\n' "$system" >>"$LOG_FILE"; fi
               fi
             fi
           else
@@ -767,25 +1474,41 @@ main() {
           ((gl_failed++))
         fi
 
+        if (( gl_failed > 0 )) && ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; fi
+
         rm -f "$temp_gl" "$count_file" "$removed_file" "$remote_temp_gl" "$master_temp_gl"
         progress_step "gamelist 처리 완료: $system"
       fi
     fi
 
-    if [[ "$SYNC_MEDIA" == "1" ]]; then
+    if [[ "$system_sync_ok" == "1" && "$ADB_DISCONNECTED" != "1" && "$SYNC_MEDIA" == "1" ]]; then
       media_dir="$LOCAL_MEDIA_ROOT/$system"
       if [[ -d "$media_dir" ]]; then
         progress_update "$PROGRESS_VALUE" "미디어 목록을 한 번에 불러오는 중: $system"
-        index_file="$TMP_DIR/remote-media-${safe_serial}-${system}.tsv"
-        build_remote_index "$serial" "$system" "$REMOTE_MEDIA_ROOT" "$index_file"
+        index_file="$TMP_DIR/remote-media-${safe_serial}-${system}.idx"
+        media_index_ok=1
+        local_media_index="$TMP_DIR/local-media-${safe_serial}-${system}.nul"
+        if ! find "$media_dir" -type f -print0 >"$local_media_index" 2>>"$LOG_FILE"; then
+          media_index_ok=0
+          ((media_failed++))
+          printf 'LOCAL MEDIA INDEX FAILED: %s; transfers/deletions blocked\n' "$system" >>"$LOG_FILE"
+        elif ! build_remote_index "$serial" "$system" "$REMOTE_MEDIA_ROOT" "$index_file"; then
+          media_index_ok=0
+          ((media_failed++))
+          printf 'MEDIA INDEX FAILED: %s; deletions blocked\n' "$system" >>"$LOG_FILE"
+          if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED after media index failure: %s\n' "$system" >>"$LOG_FILE"; fi
+        fi
 
         declare -A REMOTE_MEDIA_SIZE=()
         declare -A LOCAL_MEDIA_PRESENT=()
-        while IFS=$'\t' read -r rel rsize; do
-          [[ -n "$rel" ]] && REMOTE_MEDIA_SIZE["$rel"]="$rsize"
-        done < "$index_file"
+        if [[ "$media_index_ok" == "1" ]]; then
+          while IFS= read -r -d '' rel && IFS= read -r -d '' rsize; do
+            REMOTE_MEDIA_SIZE["$rel"]="$rsize"
+          done < "$index_file"
+        fi
 
         while IFS= read -r -d '' file; do
+          [[ "$media_index_ok" == "1" ]] || break
           ((media_seen++))
           rel="${file#"$LOCAL_MEDIA_ROOT"/}"
           LOCAL_MEDIA_PRESENT["$rel"]=1
@@ -797,22 +1520,26 @@ main() {
 
           if [[ -n "$rsize" && "$rsize" == "$lsize" ]]; then
             ((media_same++))
+          elif ! adb_connection_alive "$serial"; then
+            ADB_DISCONNECTED=1; ((media_failed++)); printf 'ADB DISCONNECTED before media update: %s\n' "$rel" >>"$LOG_FILE"; break
           elif push_file "$serial" "$file" "$REMOTE_MEDIA_ROOT/$rel"; then
             ((media_copied++))
             media_copied_files+=("✓ $rel")
             printf 'MEDIA SYNCED: %s\n' "$rel" >>"$LOG_FILE"
           else
             ((media_failed++))
+            if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED during media update: %s\n' "$rel" >>"$LOG_FILE"; break; fi
           fi
 
           progress_step "미디어 ${media_seen}/${media_total} 처리 완료"
-        done < <(find "$media_dir" -type f -print0)
+        done < "$local_media_index"
 
         # Legion Go S에 없는 원격 미디어 삭제
-        if [[ "$MIRROR_MEDIA" == "1" ]]; then
+        if [[ "$media_index_ok" == "1" && "$MIRROR_MEDIA" == "1" && "$ADB_DISCONNECTED" != "1" ]]; then
           for rel in "${!REMOTE_MEDIA_SIZE[@]}"; do
             [[ "$rel" == "$system/"* ]] || continue
             if [[ -z "${LOCAL_MEDIA_PRESENT[$rel]:-}" ]]; then
+              if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; ((media_failed++)); printf 'ADB DISCONNECTED before media delete: %s\n' "$rel" >>"$LOG_FILE"; break; fi
               if delete_remote_file "$serial" "$REMOTE_MEDIA_ROOT/$rel"; then
                 ((media_deleted++))
                 media_deleted_files+=("✗ $rel")
@@ -820,20 +1547,24 @@ main() {
               else
                 ((media_failed++))
                 printf 'MEDIA DELETE FAILED: %s\n' "$rel" >>"$LOG_FILE"
+                if ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; break; fi
               fi
             fi
           done
         fi
 
         unset REMOTE_MEDIA_SIZE LOCAL_MEDIA_PRESENT
-        rm -f "$index_file"
+        rm -f "$index_file" "$local_media_index"
       fi
     fi
+    [[ "$ADB_DISCONNECTED" == "1" ]] && break
+    [[ "$rom_abort" == 1 ]] && break
   done
 
   if [[ "$MANAGE_ESDE" == "1" && "$esde_stopped" -eq 1 ]]; then
     progress_update "$PROGRESS_VALUE" "Pocket Classic의 ES-DE를 다시 실행하고 있습니다…"
-    if start_esde "$serial" "$ESDE_ACTIVITY"; then esde_restarted=1; fi
+    if [[ "$rom_abort" == 0 && "$ADB_DISCONNECTED" != "1" ]] && adb_connection_alive "$serial" && start_esde "$serial" "$ESDE_ACTIVITY"; then esde_restarted=1
+    elif ! adb_connection_alive "$serial"; then ADB_DISCONNECTED=1; printf 'ADB DISCONNECTED before restarting ES-DE\n' >>"$LOG_FILE"; fi
     progress_step "ES-DE 재실행 완료"
   else
     progress_step "ES-DE 재실행을 건너뜁니다."
@@ -858,6 +1589,7 @@ main() {
   details+="$(append_changes "[Legion Go S altemulator 지정 게임]" 50 "${altemulator_games[@]}")"
   details+="$(append_changes "[미디어 전송]" 20 "${media_copied_files[@]}")"
   details+="$(append_changes "[미디어 삭제]" 20 "${media_deleted_files[@]}")"
+  details+="$(append_changes "[ROM 교체 및 복구 상태]" 100 "${rom_recovery_reports[@]}")"
 
   local summary="기기: $manufacturer $model
 동기화 시스템: $SYSTEMS
@@ -897,5 +1629,7 @@ altemulator 변환: ${gl_transformed}개
   fi
 }
 
-trap 'progress_close' EXIT
-main "$@"
+if [[ "${ESDE_SYNC_LIBRARY_ONLY:-0}" != "1" ]]; then
+  trap 'progress_close' EXIT
+  main "$@"
+fi

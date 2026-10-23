@@ -40,10 +40,9 @@ process = None
 lock = threading.Lock()
 
 ESDE_PACKAGE = "org.es_de.frontend"
-DEFAULT_TEMPLATE_SERIAL = "MC94516AQF040306243"
 LOCAL_ROM_ROOT = HOME / "Emulation" / "roms"
 
-APP_VERSION = "0.44"
+APP_VERSION = "0.45"
 UPDATE_META_URL = "https://api.github.com/repos/dhlim89/ESDE-Sync-for-SteamOS/contents/version.json?ref=main"
 
 
@@ -374,6 +373,49 @@ def available_systems():
             continue
     return systems
 
+def _profile_field(text, key):
+    match = re.search(r"(?m)^" + re.escape(key) + r"=(.*)$", text)
+    if not match:
+        return ""
+    try:
+        values = shlex.split(match.group(1), comments=False, posix=True)
+    except ValueError:
+        return ""
+    return values[0] if len(values) == 1 else ""
+
+
+def _profile_template_signature(text):
+    ignored = {"DEVICE_SERIAL", "DEVICE_MANUFACTURER", "DEVICE_MODEL", "SYSTEMS"}
+    return "\n".join(line for line in text.splitlines()
+                     if line.partition("=")[0] not in ignored)
+
+
+def select_profile_template(manufacturer, model):
+    """Select an existing profile by public device identity, never by its serial filename."""
+    wanted = (manufacturer.strip().casefold(), model.strip().casefold())
+    if not all(wanted):
+        return ""
+    matches = []
+    try:
+        profiles = sorted(PROFILE_DIR.glob("*.conf"), key=lambda path: path.name)
+    except OSError:
+        return ""
+    for path in profiles:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        identity = (_profile_field(text, "DEVICE_MANUFACTURER").strip().casefold(),
+                    _profile_field(text, "DEVICE_MODEL").strip().casefold())
+        if identity == wanted:
+            matches.append(text)
+    if not matches:
+        return ""
+    signatures = {_profile_template_signature(text) for text in matches}
+    # Conflicting templates for the same model are ambiguous; use safe defaults.
+    return matches[0] if len(signatures) == 1 else ""
+
+
 def register_profile_from_template(serial, systems, manufacturer, model):
     if not serial:
         return False, "등록할 기기 시리얼을 확인할 수 없습니다."
@@ -390,11 +432,9 @@ def register_profile_from_template(serial, systems, manufacturer, model):
     if target.exists():
         return True, "이미 등록된 기기입니다."
 
-    template = PROFILE_DIR / f"{DEFAULT_TEMPLATE_SERIAL}.conf"
-    if not template.exists():
-        return False, f"Android 기본 프로필을 찾을 수 없습니다: {template}"
-
-    text = template.read_text(encoding="utf-8", errors="replace")
+    # Existing profiles for the same manufacturer/model provide device-specific
+    # emulator defaults. Unknown or ambiguous devices get identity + systems only.
+    text = select_profile_template(manufacturer, model)
     for key, value in (("DEVICE_SERIAL", serial),
                        ("DEVICE_MANUFACTURER", manufacturer), ("DEVICE_MODEL", model)):
         line = key + "=" + shlex.quote(value)
