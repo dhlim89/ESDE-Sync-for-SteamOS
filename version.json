@@ -1,8 +1,8 @@
 {
-  "version": "0.44",
-  "file": "releases/ES-DE-Sync-v0.44.zip",
-  "url": "https://raw.githubusercontent.com/dhlim89/ESDE-Sync-for-SteamOS/main/releases/ES-DE-Sync-v0.44.zip",
-  "sha256": "3038ce366071fbc76f5f7d84eef52fef422beb4c2639f4564473fcf5750f1302",
-  "notes": "업데이트 저장소 주소와 KDE 메뉴 분류 수정, SteamOS 공개 소스 및 배포 구조 정리. v0.43 동기화 기능 유지.",
+  "version": "0.45",
+  "file": "releases/ES-DE-Sync-v0.45.zip",
+  "url": "https://raw.githubusercontent.com/dhlim89/ESDE-Sync-for-SteamOS/main/releases/ES-DE-Sync-v0.45.zip",
+  "sha256": "5ddb579e0e36b7842eb48b5cf35bdc07ba88522096234a7eff0d15cf073ac0e1",
+  "notes": "Android gamelist 및 원격 인덱스 안전성 개선, SHA-256 ROM 변경 감지와 검증 가능한 백업·복구, 기기별 runtime 경로 매핑 및 제조사·모델 기반 프로필 템플릿 선택 추가.",
   "channel": "stable"
 }
